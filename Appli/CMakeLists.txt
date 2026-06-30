@@ -26,8 +26,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
 set(STM32_MCU_FLAGS  "-mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard " )
 
 #Linker options
-set(STM32_LINKER_SCRIPT stm32h7r3xx_flash.ld)
-set(STM32_LINKER_OPTION  )
+set(STM32_LINKER_SCRIPT stm32h7rsxx_ROMxspi1.ld)
 
 # Set the project name
 set(CMAKE_PROJECT_NAME Lumon_Bot_MainController_Firmware_Appli)

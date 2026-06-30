@@ -32,4 +32,20 @@ if((${BUILD_CONTEXT} MATCHES .*Boot.*) OR (NOT DEFINED BUILD_CONTEXT))
 	set_property(DIRECTORY APPEND PROPERTY ADDITIONAL_CLEAN_FILES "${CMAKE_SOURCE_DIR}/Boot/build")
 	set(ST_BOOT_FLASH_BOOT_PROJECT_BUILD_TARGET ${CMAKE_SOURCE_DIR}/Boot/build/Lumon_Bot_MainController_Firmware_Boot${CMAKE_EXECUTABLE_SUFFIX_CXX} CACHE FILEPATH "Path to boot project target")
 endif()
+#-----------------------Build ExtMemLoader Project-----------------------#
+if((${BUILD_CONTEXT} MATCHES .*ExtMemLoader.*) OR (NOT DEFINED BUILD_CONTEXT))
+    message("   Build context: " ExtMemLoader)
+    ExternalProject_Add(Lumon_Bot_MainController_Firmware_ExtMemLoader
+        BINARY_DIR                  ${CMAKE_SOURCE_DIR}/ExtMemLoader/build
+        SOURCE_DIR                  ${PROJECT_SOURCE_DIR}/ExtMemLoader
+        PREFIX                      ExtMemLoader
+        CONFIGURE_HANDLED_BY_BUILD  true
+        INSTALL_COMMAND             ""
+        CMAKE_ARGS                  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON  -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}  -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+        BUILD_ALWAYS                true
+    )
+
+	set_property(DIRECTORY APPEND PROPERTY ADDITIONAL_CLEAN_FILES "${CMAKE_SOURCE_DIR}/ExtMemLoader/build")
+	set(ST_BOOT_FLASH_EXTMEMLOADER_PROJECT_BUILD_TARGET ${CMAKE_SOURCE_DIR}/ExtMemLoader/build/Lumon_Bot_MainController_Firmware_ExtMemLoader${CMAKE_EXECUTABLE_SUFFIX_CXX} CACHE FILEPATH "Path to extmemloader project target")
+endif()
 

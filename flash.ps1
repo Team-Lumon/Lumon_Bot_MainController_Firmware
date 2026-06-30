@@ -65,13 +65,45 @@ function Flash-Binary {
     Write-Host "Flashing $filePath to address $address..." -ForegroundColor Cyan
     Write-Host "--------------------------------------------------" -ForegroundColor Cyan
 
+    $cmdArgs = @("-c", "port=SWD", "mode=UR")
+
+    # If programming external memory (0x90000000)
+    if ($address -eq "0x90000000") {
+        # Convert ELF to BIN if needed to avoid RAM segments issue
+        if ($filePath.EndsWith(".elf")) {
+            $binPath = $filePath.Replace(".elf", ".bin")
+            $objcopy = "C:\ST\STM32CubeIDE_2.0.0\STM32CubeIDE\plugins\com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.100.202509120712\tools\bin\arm-none-eabi-objcopy.exe"
+            
+            Write-Host "Converting ELF to BIN to strip RAM segments..." -ForegroundColor Yellow
+            & $objcopy -O binary $filePath $binPath
+            $filePath = $binPath
+        }
+
+        # Reference our custom loader file if built, otherwise fallback to the default ST one
+        $loaderElf = Join-Path $PSScriptRoot "ExtMemLoader\build\Lumon_Bot_MainController_Firmware_ExtMemLoader.elf"
+        $loaderStldr = Join-Path $PSScriptRoot "ExtMemLoader\build\Lumon_Bot_MainController_Firmware_ExtMemLoader.stldr"
+        
+        if (Test-Path $loaderElf) {
+            # Copy elf to stldr since STM32_Programmer_CLI requires the .stldr extension
+            Copy-Item -Path $loaderElf -Destination $loaderStldr -Force
+            $loaderName = $loaderStldr
+            Write-Host "Using custom external loader: $loaderName" -ForegroundColor Green
+        } else {
+            $loaderName = "C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\ExternalLoader\MX25UW25645G_NUCLEO-H7S3L8-XSPIM1.stldr"
+        }
+        $cmdArgs += @("-el", $loaderName)
+    }
+
+    # Add program and verify commands
+    $cmdArgs += @("-w", $filePath, $address, "-v")
+
     # Connect via ST-LINK (SWD), erase and program, then verify
-    $cmdArgs = @("-c", "port=SWD", "mode=UR", "-w", $filePath, $address, "-v")
     & $programmerCli $cmdArgs
     
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Successfully flashed and verified!" -ForegroundColor Green
-    } else {
+    }
+    else {
         Write-Error "Flashing failed with exit code $LASTEXITCODE"
     }
 }
@@ -79,8 +111,8 @@ function Flash-Binary {
 # Prompt user for choices
 Write-Host "Select what to flash:"
 Write-Host "1) Flash Bootloader only (to 0x08000000)"
-Write-Host "2) Flash Application only (to 0x08000000)"
-Write-Host "3) Flash Both (Bootloader to 0x08000000, Appli to 0x08000000 - WARNING: Overwrites if both target 0x08000000)"
+Write-Host "2) Flash Application only (to 0x90000000)"
+Write-Host "3) Flash Both (Bootloader to 0x08000000, Appli to 0x90000000 - WARNING: Overwrites if both target 0x08000000)"
 $choice = Read-Host "Enter option (1, 2, or 3)"
 
 switch ($choice) {
@@ -88,11 +120,11 @@ switch ($choice) {
         Flash-Binary -filePath $bootloaderElf -address "0x08000000"
     }
     "2" {
-        Flash-Binary -filePath $applicationElf -address "0x08000000"
+        Flash-Binary -filePath $applicationElf -address "0x90000000"
     }
     "3" {
         Flash-Binary -filePath $bootloaderElf -address "0x08000000"
-        Flash-Binary -filePath $applicationElf -address "0x08000000"
+        Flash-Binary -filePath $applicationElf -address "0x90000000"
     }
     default {
         Write-Host "Invalid choice. Exiting." -ForegroundColor Red

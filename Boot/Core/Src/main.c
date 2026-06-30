@@ -22,7 +22,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,7 +65,7 @@ static void MX_USART3_UART_Init(void);
 static void MX_USB_OTG_HS_PCD_Init(void);
 static void MX_XSPI1_Init(void);
 /* USER CODE BEGIN PFP */
-
+void ExecuteApplication(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -84,7 +84,7 @@ int main(void) {
   /* USER CODE END 1 */
 
   /* MPU Configuration--------------------------------------------------------*/
-  MPU_Config();
+  // MPU_Config();
 
   /* MCU Configuration--------------------------------------------------------*/
 
@@ -105,24 +105,32 @@ int main(void) {
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  /* MX_FDCAN1_Init();
+  MX_XSPI1_Init();
+
+  /* MX_FDCAN1_Init(); */
   MX_USART1_UART_Init();
   MX_USART3_UART_Init();
-  MX_USB_OTG_HS_PCD_Init();
-  MX_XSPI1_Init();
+  /* MX_USB_OTG_HS_PCD_Init();
   MX_USB_DEVICE_Init(); */
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
 
+  /* Blink LED quickly to indicate Bootloader is running and wait 3 seconds to
+   * allow ST-Link to connect */
+  for (int i = 0; i < 30; i++) {
+    HAL_GPIO_TogglePin(debugLED_GPIO_Port, debugLED_Pin);
+    HAL_Delay(100);
+  }
+
+  /* Jump to Application */
+  ExecuteApplication();
+
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1) {
     /* USER CODE END WHILE */
-    HAL_GPIO_TogglePin(debugLED_GPIO_Port, debugLED_Pin);
 
-    // Delays for 500 milliseconds (0.5 seconds)
-    HAL_Delay(500);
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -340,13 +348,13 @@ static void MX_XSPI1_Init(void) {
   hxspi1.Init.FifoThresholdByte = 1;
   hxspi1.Init.MemoryMode = HAL_XSPI_SINGLE_MEM;
   hxspi1.Init.MemoryType = HAL_XSPI_MEMTYPE_MICRON;
-  hxspi1.Init.MemorySize = HAL_XSPI_SIZE_16B;
+  hxspi1.Init.MemorySize = HAL_XSPI_SIZE_64MB;
   hxspi1.Init.ChipSelectHighTimeCycle = 1;
   hxspi1.Init.FreeRunningClock = HAL_XSPI_FREERUNCLK_DISABLE;
   hxspi1.Init.ClockMode = HAL_XSPI_CLOCK_MODE_0;
   hxspi1.Init.WrapSize = HAL_XSPI_WRAP_NOT_SUPPORTED;
   hxspi1.Init.ClockPrescaler = 0;
-  hxspi1.Init.SampleShifting = HAL_XSPI_SAMPLE_SHIFT_NONE;
+  hxspi1.Init.SampleShifting = HAL_XSPI_SAMPLE_SHIFT_HALFCYCLE;
   hxspi1.Init.ChipSelectBoundary = HAL_XSPI_BONDARYOF_NONE;
   hxspi1.Init.MaxTran = 0;
   hxspi1.Init.Refresh = 0;
@@ -414,6 +422,7 @@ static void MX_GPIO_Init(void) {
   __HAL_RCC_GPIOP_CLK_ENABLE();
   __HAL_RCC_GPIOO_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(debugLED_GPIO_Port, debugLED_Pin, GPIO_PIN_RESET);
@@ -437,7 +446,169 @@ static void MX_GPIO_Init(void) {
 }
 
 /* USER CODE BEGIN 4 */
+void ExecuteApplication(void) {
+  XSPI_RegularCmdTypeDef s_command = {0};
+  XSPI_MemoryMappedTypeDef sMemMappedCfg = {0};
 
+  /* Read QSPI/XSPI Flash JEDEC ID */
+  uint8_t id_buf[3] = {0};
+  s_command.OperationType = HAL_XSPI_OPTYPE_COMMON_CFG;
+  s_command.IOSelect = HAL_XSPI_SELECT_IO_3_0;
+  s_command.Instruction = 0x9F; // JEDEC ID Read command (9Fh)
+  s_command.InstructionMode = HAL_XSPI_INSTRUCTION_1_LINE;
+  s_command.InstructionWidth = HAL_XSPI_INSTRUCTION_8_BITS;
+  s_command.InstructionDTRMode = HAL_XSPI_INSTRUCTION_DTR_DISABLE;
+  s_command.AddressMode = HAL_XSPI_ADDRESS_NONE;
+  s_command.AlternateBytesMode = HAL_XSPI_ALT_BYTES_NONE;
+  s_command.DataMode = HAL_XSPI_DATA_1_LINE;
+  s_command.DataDTRMode = HAL_XSPI_DATA_DTR_DISABLE;
+  s_command.DummyCycles = 0;
+  s_command.DQSMode = HAL_XSPI_DQS_DISABLE;
+  s_command.DataLength = 3;
+
+  printf("Querying flash JEDEC ID...\r\n");
+  if (HAL_XSPI_Command(&hxspi1, &s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) ==
+      HAL_OK) {
+    if (HAL_XSPI_Receive(&hxspi1, id_buf, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) ==
+        HAL_OK) {
+      printf("Flash JEDEC ID: %02X %02X %02X\r\n", id_buf[0], id_buf[1],
+             id_buf[2]);
+    } else {
+      printf("Failed to receive JEDEC ID!\r\n");
+    }
+  } else {
+    printf("Failed to send JEDEC ID read command!\r\n");
+  }
+
+  /* Configure the read operation */
+  s_command.OperationType = HAL_XSPI_OPTYPE_READ_CFG;
+  s_command.IOSelect = HAL_XSPI_SELECT_IO_3_0;
+  s_command.Instruction = 0xEB; // Quad I/O Fast Read command (EBh)
+  s_command.InstructionMode = HAL_XSPI_INSTRUCTION_1_LINE;
+  s_command.InstructionWidth = HAL_XSPI_INSTRUCTION_8_BITS;
+  s_command.InstructionDTRMode = HAL_XSPI_INSTRUCTION_DTR_DISABLE;
+  s_command.Address = 0;
+  s_command.AddressMode = HAL_XSPI_ADDRESS_4_LINES;
+  s_command.AddressWidth = HAL_XSPI_ADDRESS_24_BITS;
+  s_command.AddressDTRMode = HAL_XSPI_ADDRESS_DTR_DISABLE;
+  s_command.AlternateBytes = 0;
+  s_command.AlternateBytesMode = HAL_XSPI_ALT_BYTES_NONE;
+  s_command.AlternateBytesWidth = HAL_XSPI_ALT_BYTES_8_BITS;
+  s_command.AlternateBytesDTRMode = HAL_XSPI_ALT_BYTES_DTR_DISABLE;
+  s_command.DataMode = HAL_XSPI_DATA_4_LINES;
+  s_command.DataDTRMode = HAL_XSPI_DATA_DTR_DISABLE;
+  s_command.DummyCycles = 6; // 6 dummy cycles for 0xEB Quad I/O Read
+  s_command.DQSMode = HAL_XSPI_DQS_DISABLE;
+
+  if (HAL_XSPI_Command(&hxspi1, &s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) !=
+      HAL_OK) {
+    Error_Handler();
+  }
+
+  /* Configure the write operation */
+  s_command.OperationType = HAL_XSPI_OPTYPE_WRITE_CFG;
+  s_command.Instruction = 0x02; // Standard Page Program (02h)
+  s_command.DummyCycles = 0;
+
+  if (HAL_XSPI_Command(&hxspi1, &s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) !=
+      HAL_OK) {
+    Error_Handler();
+  }
+
+  /* Enable Memory Mapped Mode */
+  sMemMappedCfg.TimeOutActivation = HAL_XSPI_TIMEOUT_COUNTER_DISABLE;
+  sMemMappedCfg.TimeoutPeriodClock = 0x50;
+  if (HAL_XSPI_MemoryMapped(&hxspi1, &sMemMappedCfg) != HAL_OK) {
+    Error_Handler();
+  }
+
+  /* Check if application vector table is valid before jumping */
+  printf("\r\n--- Bootloader Phase ---\r\n");
+  printf("Reading application vector table at 0x90000000...\r\n");
+  uint32_t stackPointer = *(__IO uint32_t *)(0x90000000);
+  uint32_t jumpAddress = *(__IO uint32_t *)(0x90000000 + 4);
+  printf("Stack Pointer: 0x%08lX\r\n", (unsigned long)stackPointer);
+  printf("Jump Address (Reset Vector): 0x%08lX\r\n",
+         (unsigned long)jumpAddress);
+
+  // Diagnostic Blinking:
+  // We will blink the LED to show the read values, then loop infinitely.
+  // This will tell us what's actually being read!
+
+  // Phase 1: Show stackPointer status
+  // 1 blink = 0xFFFFFFFF
+  // 2 blinks = 0x00000000
+  // 3 blinks = Other value (valid-looking or partially correct)
+  int sp_blinks = 3;
+  if (stackPointer == 0xFFFFFFFF)
+    sp_blinks = 1;
+  else if (stackPointer == 0x00000000)
+    sp_blinks = 2;
+
+  // Phase 2: Show jumpAddress status
+  // 1 blink = 0xFFFFFFFF
+  // 2 blinks = 0x00000000
+  // 3 blinks = Other value (valid-looking or partially correct)
+  int jmp_blinks = 3;
+  if (jumpAddress == 0xFFFFFFFF)
+    jmp_blinks = 1;
+  else if (jumpAddress == 0x00000000)
+    jmp_blinks = 2;
+
+  // Only enter the diagnostic blinking loop if stackPointer or jumpAddress is
+  // invalid
+  if (stackPointer == 0xFFFFFFFF || stackPointer == 0x00000000 ||
+      jumpAddress == 0xFFFFFFFF || jumpAddress == 0x00000000) {
+    printf("ERROR: Invalid vector table detected! Entering diagnostic blink "
+           "loop...\r\n");
+    while (1) {
+      // Blink SP status (slow blinks)
+      for (int b = 0; b < sp_blinks; b++) {
+        HAL_GPIO_WritePin(debugLED_GPIO_Port, debugLED_Pin, GPIO_PIN_SET);
+        HAL_Delay(400);
+        HAL_GPIO_WritePin(debugLED_GPIO_Port, debugLED_Pin, GPIO_PIN_RESET);
+        HAL_Delay(400);
+      }
+      HAL_Delay(1000); // 1s pause between phases
+
+      // Blink Jump Address status (fast blinks)
+      for (int b = 0; b < jmp_blinks; b++) {
+        HAL_GPIO_WritePin(debugLED_GPIO_Port, debugLED_Pin, GPIO_PIN_SET);
+        HAL_Delay(150);
+        HAL_GPIO_WritePin(debugLED_GPIO_Port, debugLED_Pin, GPIO_PIN_RESET);
+        HAL_Delay(150);
+      }
+      HAL_Delay(2000); // 2s pause before repeating
+    }
+  }
+
+  printf("Vector table appears valid. Setting VTOR to 0x90000000 and jumping "
+         "to application...\r\n");
+  printf("----------------------------------------\r\n\r\n");
+
+  /* Define function pointer for application entry point */
+  typedef void (*pFunction)(void);
+  pFunction jumpToApplication = (pFunction)jumpAddress;
+
+  /* Initialize Vector Table */
+  SCB->VTOR = 0x90000000;
+
+  /* Initialize user application's Stack Pointer */
+  __set_MSP(stackPointer);
+
+  /* Jump to application */
+  jumpToApplication();
+}
+
+/**
+ * @brief Redirects printf stdout to both USART1 and USART3 so TTL adapters
+ * connected to either can read it.
+ */
+int __io_putchar(int ch) {
+  HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+  HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+  return ch;
+}
 /* USER CODE END 4 */
 
 /* MPU Configuration */

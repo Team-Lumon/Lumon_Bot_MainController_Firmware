@@ -1,20 +1,20 @@
 /* USER CODE BEGIN Header */
 /**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
+ ******************************************************************************
+ * @file           : main.c
+ * @brief          : Main program body
+ ******************************************************************************
+ * @attention
+ *
+ * Copyright (c) 2026 STMicroelectronics.
+ * All rights reserved.
+ *
+ * This software is licensed under terms that can be found in the LICENSE file
+ * in the root directory of this software component.
+ * If no LICENSE file comes with this software, it is provided AS-IS.
+ *
+ ******************************************************************************
+ */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
@@ -22,7 +22,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -79,7 +79,6 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -100,20 +99,82 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_FDCAN1_Init();
+  
+  // Note: MX_USART1_UART_Init and MX_USART3_UART_Init must run first to enable debugging output
   MX_USART1_UART_Init();
   MX_USART3_UART_Init();
-  MX_USB_OTG_HS_PCD_Init();
-  MX_XSPI1_Init();
-  MX_USB_DEVICE_Init();
-  /* USER CODE BEGIN 2 */
+  
+  printf("\r\n--- Main Application Starting ---\r\n");
+  
+  /* Print Clock Frequencies */
+  printf("HSE Value (Assumed): %lu Hz\r\n", HSE_VALUE);
+  printf("System Clock (SYSCLK): %lu Hz\r\n", HAL_RCC_GetSysClockFreq());
+  printf("AHB Clock (HCLK):      %lu Hz\r\n", HAL_RCC_GetHCLKFreq());
+  printf("APB1 Clock (PCLK1):    %lu Hz\r\n", HAL_RCC_GetPCLK1Freq());
+  printf("APB2 Clock (PCLK2):    %lu Hz\r\n", HAL_RCC_GetPCLK2Freq());
+  
+  uint32_t sysclk_source = __HAL_RCC_GET_SYSCLK_SOURCE();
+  if (sysclk_source == RCC_SYSCLKSOURCE_STATUS_HSI) {
+    printf("SYSCLK Source: Internal HSI (64 MHz)\r\n");
+  } else if (sysclk_source == RCC_SYSCLKSOURCE_STATUS_HSE) {
+    printf("SYSCLK Source: External HSE (24 MHz)\r\n");
+  } else if (sysclk_source == RCC_SYSCLKSOURCE_STATUS_PLLCLK) {
+    uint32_t pll_src = READ_BIT(RCC->PLLCKSELR, RCC_PLLCKSELR_PLLSRC);
+    if (pll_src == RCC_PLLSOURCE_HSI) {
+      printf("SYSCLK Source: PLL1 (Sourced from Internal HSI)\r\n");
+    } else if (pll_src == RCC_PLLSOURCE_HSE) {
+      printf("SYSCLK Source: PLL1 (Sourced from External HSE)\r\n");
+    } else {
+      printf("SYSCLK Source: PLL1 (Sourced from HSI48/CSI)\r\n");
+    }
+  } else {
+    printf("SYSCLK Source: Other\r\n");
+  }
 
+  printf("Initializing FDCAN1...\r\n");
+  MX_FDCAN1_Init();
+  printf("FDCAN1 Initialized.\r\n");
+
+  /* printf("Initializing USB OTG HS...\r\n");
+  MX_USB_OTG_HS_PCD_Init();
+  printf("USB OTG HS Initialized.\r\n"); */
+
+  printf("Initializing USB Device Stack (Full Speed)...\r\n");
+  MX_USB_DEVICE_Init();
+  printf("USB Device Stack Initialized.\r\n");
+
+  /* USER CODE BEGIN 2 */
+  printf("All peripherals initialized. Entering main loop...\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
+  printf("\r\n=== UART Bridge Mode Active: PC (UART3) <-> ESP32 (UART1) ===\r\n");
+  
+  while (1) {
+    /* Clear any UART errors on USART1 (ESP32) */
+    if (USART1->ISR & (USART_ISR_ORE | USART_ISR_NE | USART_ISR_FE | USART_ISR_PE)) {
+      USART1->ICR = USART_ICR_ORECF | USART_ICR_NECF | USART_ICR_FECF | USART_ICR_PECF;
+    }
+
+    /* Clear any UART errors on USART3 (PC) */
+    if (USART3->ISR & (USART_ISR_ORE | USART_ISR_NE | USART_ISR_FE | USART_ISR_PE)) {
+      USART3->ICR = USART_ICR_ORECF | USART_ICR_NECF | USART_ICR_FECF | USART_ICR_PECF;
+    }
+
+    /* Forward data from PC (USART3) to ESP32 (USART1) */
+    if (USART3->ISR & USART_ISR_RXNE_RXFNE) {
+      uint8_t byte = USART3->RDR;
+      while (!(USART1->ISR & USART_ISR_TXE_TXFNF));
+      USART1->TDR = byte;
+    }
+
+    /* Forward data from ESP32 (USART1) to PC (USART3) */
+    if (USART1->ISR & USART_ISR_RXNE_RXFNE) {
+      uint8_t byte = USART1->RDR;
+      while (!(USART3->ISR & USART_ISR_TXE_TXFNF));
+      USART3->TDR = byte;
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -282,13 +343,13 @@ static void MX_XSPI1_Init(void)
   hxspi1.Init.FifoThresholdByte = 1;
   hxspi1.Init.MemoryMode = HAL_XSPI_SINGLE_MEM;
   hxspi1.Init.MemoryType = HAL_XSPI_MEMTYPE_MICRON;
-  hxspi1.Init.MemorySize = HAL_XSPI_SIZE_16B;
+  hxspi1.Init.MemorySize = HAL_XSPI_SIZE_64MB;
   hxspi1.Init.ChipSelectHighTimeCycle = 1;
   hxspi1.Init.FreeRunningClock = HAL_XSPI_FREERUNCLK_DISABLE;
   hxspi1.Init.ClockMode = HAL_XSPI_CLOCK_MODE_0;
   hxspi1.Init.WrapSize = HAL_XSPI_WRAP_NOT_SUPPORTED;
   hxspi1.Init.ClockPrescaler = 0;
-  hxspi1.Init.SampleShifting = HAL_XSPI_SAMPLE_SHIFT_NONE;
+  hxspi1.Init.SampleShifting = HAL_XSPI_SAMPLE_SHIFT_HALFCYCLE;
   hxspi1.Init.ChipSelectBoundary = HAL_XSPI_BONDARYOF_NONE;
   hxspi1.Init.MaxTran = 0;
   hxspi1.Init.Refresh = 0;
@@ -335,8 +396,10 @@ static void MX_USB_OTG_HS_PCD_Init(void)
   hpcd_USB_OTG_HS.Init.lpm_enable = DISABLE;
   hpcd_USB_OTG_HS.Init.use_dedicated_ep1 = DISABLE;
   hpcd_USB_OTG_HS.Init.vbus_sensing_enable = DISABLE;
-  if (HAL_PCD_Init(&hpcd_USB_OTG_HS) != HAL_OK)
+  HAL_StatusTypeDef status = HAL_PCD_Init(&hpcd_USB_OTG_HS);
+  if (status != HAL_OK)
   {
+    printf("HAL_PCD_Init failed! Status: %d\r\n", status);
     Error_Handler();
   }
   /* USER CODE BEGIN USB_OTG_HS_PCD_Init 2 */
@@ -362,6 +425,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOP_CLK_ENABLE();
   __HAL_RCC_GPIOO_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(debugLED_GPIO_Port, debugLED_Pin, GPIO_PIN_RESET);
@@ -385,7 +449,13 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+/**
+  * @brief Redirects printf stdout to both USART1 and USART3 for application logging.
+  */
+int __io_putchar(int ch) {
+  HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+  return ch;
+}
 /* USER CODE END 4 */
 
 /**
@@ -396,9 +466,9 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
+  printf("\r\n!!! ERROR_HANDLER CALLED - SYSTEM HALTING !!!\r\n");
   __disable_irq();
-  while (1)
-  {
+  while (1) {
   }
   /* USER CODE END Error_Handler_Debug */
 }
@@ -413,8 +483,9 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* User can add his own implementation to report the file name and line
+     number, ex: printf("Wrong parameters value: file %s on line %d\r\n", file,
+     line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
