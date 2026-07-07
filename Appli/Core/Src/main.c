@@ -22,6 +22,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "can_bus.h"
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -52,7 +53,8 @@ XSPI_HandleTypeDef hxspi1;
 PCD_HandleTypeDef hpcd_USB_OTG_HS;
 
 /* USER CODE BEGIN PV */
-
+static volatile uint8_t can_send_pending;
+uint32_t canValue = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -68,6 +70,89 @@ static void MX_XSPI1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static void PrintCanMessage(const char *prefix, const CAN_BusMessage_t *message)
+{
+  if ((prefix == NULL) || (message == NULL)) {
+    return;
+  }
+
+  printf("%s id=0x%03lX dlc=%u data:",
+         prefix,
+         (unsigned long)message->id,
+         message->dlc);
+
+  for (uint8_t i = 0; i < message->dlc; i++) {
+    printf(" %02X", message->data[i]);
+  }
+
+  if (message->dlc >= 4U) {
+    printf(" value_u32=%lu", (unsigned long)CAN_Bus_ReadU32(message));
+  } else if (message->dlc >= 2U) {
+    printf(" value_u16=%u", CAN_Bus_ReadU16(message));
+  } else if (message->dlc >= 1U) {
+    printf(" value_u8=%u", CAN_Bus_ReadU8(message));
+  }
+
+  printf("\r\n");
+}
+
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *fdcan_handle, uint32_t RxFifo0ITs)
+{
+    if ((fdcan_handle == &CAN) && ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != 0U)) {
+      CAN_BusMessage_t message = {0};
+
+      if (CAN_Bus_Receive(&CAN, &message) == HAL_OK) {
+        PrintCanMessage("CAN RX", &message);
+
+        switch (message.id) {
+          case CAN_ID_ADC_REPORT: {
+            uint32_t absolute_position = CAN_Bus_ReadU32(&message);
+            printf(absolute_position ? "ADC value: %lu\r\n" : "Failed to read ADC value\r\n", (unsigned long)absolute_position);
+            break;
+          }
+          case CAN_ID_STATUS: {
+            char status = (char)CAN_Bus_ReadU8(&message);
+            switch (status) {
+              case 'R':
+                printf("Resetting ....\r\n");
+                HAL_NVIC_SystemReset();
+                break;
+              default:
+                break;
+            }
+            break;
+          }
+          case CAN_ID_DEBUG:
+            printf("Debug value: %lu\r\n", (unsigned long)CAN_Bus_ReadU32(&message));
+            break;
+          default:
+            printf("Received message with unhandled ID: 0x%03lX\r\n", (unsigned long)message.id);
+            break;
+        }
+      }
+    }
+}
+
+void REQUEST_SEND_CAN(void)
+{
+  can_send_pending = 1U;
+}
+
+void SEND_CAN(void)
+{
+  if (CAN_Bus_SendU32(&CAN, CAN_ID_DEBUG, canValue) != HAL_OK) {
+    FDCAN_ProtocolStatusTypeDef protocol_status = {0};
+    (void)HAL_FDCAN_GetProtocolStatus(&CAN, &protocol_status);
+    printf("Failed to send CAN message err=0x%08lX lec=%lu bus_off=%lu\r\n",
+           (unsigned long)HAL_FDCAN_GetError(&CAN),
+           (unsigned long)protocol_status.LastErrorCode,
+           (unsigned long)protocol_status.BusOff);
+  } else {
+    printf("Sent CAN message with value: %lu\r\n", (unsigned long)canValue);
+    canValue++;
+  }
+}
 
 /* USER CODE END 0 */
 
@@ -145,13 +230,29 @@ int main(void)
 
   /* USER CODE BEGIN 2 */
   printf("All peripherals initialized. Entering main loop...\r\n");
+  printf("CAN init : ");
+  printf(CAN_Bus_Init(&CAN) ? "Failed\r\n" : "Success\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   printf("\r\n=== UART Bridge Mode Active: PC (UART3) <-> ESP32 (UART1) ===\r\n");
   
+  uint32_t last_can_send_tick = 0;
+  
   while (1) {
+    /* Periodically request sending a CAN message every 1000ms */
+    uint32_t current_tick = HAL_GetTick();
+    if (current_tick - last_can_send_tick >= 1000U) {
+      last_can_send_tick = current_tick;
+      REQUEST_SEND_CAN();
+    }
+
+    if (can_send_pending != 0U) {
+      can_send_pending = 0U;
+      SEND_CAN();
+    }
+
     /* Clear any UART errors on USART1 (ESP32) */
     if (USART1->ISR & (USART_ISR_ORE | USART_ISR_NE | USART_ISR_FE | USART_ISR_PE)) {
       USART1->ICR = USART_ICR_ORECF | USART_ICR_NECF | USART_ICR_FECF | USART_ICR_PECF;
@@ -175,6 +276,7 @@ int main(void)
       while (!(USART3->ISR & USART_ISR_TXE_TXFNF));
       USART3->TDR = byte;
     }
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -201,18 +303,18 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
   hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
   hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
-  hfdcan1.Init.AutoRetransmission = DISABLE;
-  hfdcan1.Init.TransmitPause = DISABLE;
+  hfdcan1.Init.AutoRetransmission = ENABLE;
+  hfdcan1.Init.TransmitPause = ENABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
-  hfdcan1.Init.NominalPrescaler = 16;
-  hfdcan1.Init.NominalSyncJumpWidth = 1;
-  hfdcan1.Init.NominalTimeSeg1 = 1;
-  hfdcan1.Init.NominalTimeSeg2 = 1;
+  hfdcan1.Init.NominalPrescaler = 3;
+  hfdcan1.Init.NominalSyncJumpWidth = 2;
+  hfdcan1.Init.NominalTimeSeg1 = 13;
+  hfdcan1.Init.NominalTimeSeg2 = 2;
   hfdcan1.Init.DataPrescaler = 1;
   hfdcan1.Init.DataSyncJumpWidth = 1;
   hfdcan1.Init.DataTimeSeg1 = 1;
   hfdcan1.Init.DataTimeSeg2 = 1;
-  hfdcan1.Init.StdFiltersNbr = 0;
+  hfdcan1.Init.StdFiltersNbr = 1;
   hfdcan1.Init.ExtFiltersNbr = 0;
   hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
   if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
@@ -449,9 +551,6 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-/**
-  * @brief Redirects printf stdout to both USART1 and USART3 for application logging.
-  */
 int __io_putchar(int ch) {
   HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
   return ch;

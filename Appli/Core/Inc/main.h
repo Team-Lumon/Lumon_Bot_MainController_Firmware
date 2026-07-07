@@ -60,6 +60,7 @@ void Error_Handler(void);
 #define espUart huart1
 #define debugUart huart3
 #define TMC hfdcan1
+#define CAN hfdcan1
 #define debugLED_Pin GPIO_PIN_2
 #define debugLED_GPIO_Port GPIOB
 #define EStop_Pin GPIO_PIN_5
