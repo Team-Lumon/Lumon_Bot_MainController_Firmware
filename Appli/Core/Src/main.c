@@ -117,26 +117,12 @@ HAL_StatusTypeDef SendMotorCommands(const MotorCommand_t *commands) {
     packed_val |= ((uint32_t)(len_u12 & 0xFFFU)) << 0;
     packed_val |= ((uint32_t)(vel_s12 & 0xFFFU)) << 12;
     packed_val |= ((uint32_t)tension_u8) << 24;
-
-    // 5. Build the CAN message payload (8 bytes)
-    uint8_t payload[8];
-    payload[0] = 0x00; // Source ID (0x00 = Controller/Main PCB)
-    payload[1] = 0x01; // Command ID (0x01 = target command)
-    payload[2] = 0x00; // Reserved
-    payload[3] = 0x00; // Reserved
-
-    // Last 32 bits (Bytes 4..7) in Little Endian:
-    payload[4] = (uint8_t)(packed_val & 0xFFU);
-    payload[5] = (uint8_t)((packed_val >> 8) & 0xFFU);
-    payload[6] = (uint8_t)((packed_val >> 16) & 0xFFU);
-    payload[7] = (uint8_t)((packed_val >> 24) & 0xFFU);
-
-    // 6. Build the 11-bit CAN ID with Destination Device ID set to motor_ids[i]
-    uint16_t can_id =
-        CAN_BUILD_ID(CAN_Priority_HIGH, CAN_ID_COMMAND, motor_ids[i]);
-
-    // 7. Send the CAN message
-    HAL_StatusTypeDef status = CAN_Bus_SendRaw(&CAN, can_id, payload, 8);
+    
+    // 5. Send the CAN message exactly like the Motor Driver format (4 bytes /
+    // 32 bits) The updated CAN library handles the 11-bit ID creation
+    // internally based on these arguments!
+    HAL_StatusTypeDef status = CAN_Bus_SendU32(
+        &CAN, motor_ids[i], CAN_ID_COMMAND, CAN_Priority_HIGH, packed_val);
     uint32_t active_buffer_mask = hfdcan1.LatestTxFifoQRequest;
 
     // Wait 2ms for the hardware transmission attempt to finish
@@ -232,7 +218,8 @@ static void PrintCanMessage(const char *prefix,
     return;
   }
 
-  printf("%s id=0x%03lX dlc=%u data:", prefix, (unsigned long)message->id,
+  printf("%s device=0x%X msg=0x%X prio=0x%X dlc=%u data:", prefix,
+         message->deviceId, message->messageId, message->priority,
          message->dlc);
 
   for (uint8_t i = 0; i < message->dlc; i++) {
@@ -259,7 +246,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *fdcan_handle,
     if (CAN_Bus_Receive(&CAN, &message) == HAL_OK) {
       PrintCanMessage("CAN RX", &message);
 
-      switch (message.id) {
+      switch (message.messageId) {
       case CAN_ID_ADC_REPORT: {
         uint32_t absolute_position = CAN_Bus_ReadU32(&message);
         printf(absolute_position ? "ADC value: %lu\r\n"
@@ -285,7 +272,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *fdcan_handle,
         break;
       default:
         printf("Received message with unhandled ID: 0x%03lX\r\n",
-               (unsigned long)message.id);
+               (unsigned long)message.messageId);
         break;
       }
     }
@@ -295,7 +282,8 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *fdcan_handle,
 void REQUEST_SEND_CAN(void) { can_send_pending = 1U; }
 
 void SEND_CAN(void) {
-  if (CAN_Bus_SendU32(&CAN, CAN_ID_DEBUG, canValue) != HAL_OK) {
+  if (CAN_Bus_SendU32(&CAN, 0x0F, CAN_ID_DEBUG, CAN_Priority_LOW, canValue) !=
+      HAL_OK) {
     FDCAN_ProtocolStatusTypeDef protocol_status = {0};
     (void)HAL_FDCAN_GetProtocolStatus(&CAN, &protocol_status);
     printf("Failed to send CAN message err=0x%08lX lec=%lu bus_off=%lu\r\n",
@@ -386,7 +374,7 @@ int main(void) {
   /* USER CODE BEGIN 2 */
   printf("All peripherals initialized. Entering main loop...\r\n");
   printf("CAN init : ");
-  printf(CAN_Bus_Init(&CAN) ? "Failed\r\n" : "Success\r\n");
+  printf(CAN_Bus_Init(&CAN, 0x00) ? "Failed\r\n" : "Success\r\n");
 
   /*
   printf("Initializing IK Geometry...\r\n");
