@@ -23,7 +23,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "can_bus.h"
+#include "ik_wrapper.h"
 #include <stdio.h>
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -55,6 +57,10 @@ PCD_HandleTypeDef hpcd_USB_OTG_HS;
 /* USER CODE BEGIN PV */
 static volatile uint8_t can_send_pending;
 uint32_t canValue = 0;
+static MotorCommand_t all_commands[151][8];
+static int total_steps = 150;
+static int current_send_step = 0;
+static bool trajectory_ready = false;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -70,16 +76,163 @@ static void MX_XSPI1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+HAL_StatusTypeDef SendMotorCommands(const MotorCommand_t *commands) {
+  if (commands == NULL)
+    return HAL_ERROR;
 
-static void PrintCanMessage(const char *prefix, const CAN_BusMessage_t *message)
-{
+  static const uint16_t motor_ids[4] = {1, 2, 4, 8};
+  HAL_StatusTypeDef overall_status = HAL_OK;
+
+  for (int i = 0; i < 4; i++) {
+    // 1. Scale L_total to uint16_t (in 1.0 mm resolution).
+    float len_mm = commands[i].L_total * 1000.0f;
+    if (len_mm < 0.0f)
+      len_mm = 0.0f;
+    if (len_mm > 4095.0f)
+      len_mm = 4095.0f;
+    uint16_t len_u12 = (uint16_t)len_mm;
+
+    // 2. Scale L_dot (velocity) to signed 12-bit int (range -2048 to 2047, 1.0
+    // mm/s per LSb).
+    float vel_scaled = commands[i].L_dot * 1000.0f;
+    if (vel_scaled < -2048.0f)
+      vel_scaled = -2048.0f;
+    if (vel_scaled > 2047.0f)
+      vel_scaled = 2047.0f;
+    int16_t vel_s12 = (int16_t)vel_scaled;
+
+    // 3. Scale tau (tension) to 8-bit unsigned (range 0 to 255, 1.0 N per LSb).
+    float tension_n = commands[i].tau;
+    if (tension_n < 0.0f)
+      tension_n = 0.0f;
+    if (tension_n > 255.0f)
+      tension_n = 255.0f;
+    uint8_t tension_u8 = (uint8_t)tension_n;
+
+    // 4. Bit-pack into 32-bit word:
+    // Bits 0..11: len_u12
+    // Bits 12..23: vel_s12
+    // Bits 24..31: tension_u8
+    uint32_t packed_val = 0;
+    packed_val |= ((uint32_t)(len_u12 & 0xFFFU)) << 0;
+    packed_val |= ((uint32_t)(vel_s12 & 0xFFFU)) << 12;
+    packed_val |= ((uint32_t)tension_u8) << 24;
+
+    // 5. Build the CAN message payload (8 bytes)
+    uint8_t payload[8];
+    payload[0] = 0x00; // Source ID (0x00 = Controller/Main PCB)
+    payload[1] = 0x01; // Command ID (0x01 = target command)
+    payload[2] = 0x00; // Reserved
+    payload[3] = 0x00; // Reserved
+
+    // Last 32 bits (Bytes 4..7) in Little Endian:
+    payload[4] = (uint8_t)(packed_val & 0xFFU);
+    payload[5] = (uint8_t)((packed_val >> 8) & 0xFFU);
+    payload[6] = (uint8_t)((packed_val >> 16) & 0xFFU);
+    payload[7] = (uint8_t)((packed_val >> 24) & 0xFFU);
+
+    // 6. Build the 11-bit CAN ID with Destination Device ID set to motor_ids[i]
+    uint16_t can_id =
+        CAN_BUILD_ID(CAN_Priority_HIGH, CAN_ID_COMMAND, motor_ids[i]);
+
+    // 7. Send the CAN message
+    HAL_StatusTypeDef status = CAN_Bus_SendRaw(&CAN, can_id, payload, 8);
+    uint32_t active_buffer_mask = hfdcan1.LatestTxFifoQRequest;
+
+    // Wait 2ms for the hardware transmission attempt to finish
+    HAL_Delay(2);
+
+    // Check if transmission completed successfully (ACKed) via TXBTO register
+    bool acked = (hfdcan1.Instance->TXBTO & active_buffer_mask) != 0U;
+
+    printf("  Motor %u: %s (ACK: %s)\r\n", motor_ids[i],
+           (status == HAL_OK) ? "Queued OK" : "Queue FULL",
+           acked ? "YES" : "NO");
+
+    if (status != HAL_OK) {
+      overall_status = status;
+    }
+  }
+
+  return overall_status;
+}
+
+void run_ik_test(void) {
+  printf("\r\n=== Running IK Trajectory Test ===\r\n");
+  Vector3_t r_start = {0.46f, 0.56f, 0.7f};
+  Vector3_t r_end = {0.50f, 0.3f, 0.30f};
+
+  float T_MOVE = 10.0f;
+  float FRAME_DT = 0.1f;
+
+  total_steps = (int)(T_MOVE / FRAME_DT);
+  if (total_steps > 150)
+    total_steps = 150;
+
+  Vector3_t r_out, r_dot_out;
+
+  printf("1. Pre-calculating all trajectory steps...\r\n");
+
+  uint32_t start_tick = HAL_GetTick();
+  for (int step = 0; step <= total_steps; ++step) {
+    float t = step * FRAME_DT;
+    if (t > T_MOVE)
+      t = T_MOVE;
+
+    computeFrameTargetsWrapper(t, &r_start, &r_end, all_commands[step], &r_out,
+                               &r_dot_out);
+  }
+  uint32_t elapsed_tick = HAL_GetTick() - start_tick;
+
+  // Print details to the console now that timing is complete
+  for (int step = 0; step <= total_steps; ++step) {
+    float t = step * FRAME_DT;
+    if (t > T_MOVE)
+      t = T_MOVE;
+
+    // We already calculated this, but we extract the position and velocity for
+    // printing
+    computeFrameTargetsWrapper(t, &r_start, &r_end, all_commands[step], &r_out,
+                               &r_dot_out);
+
+    printf("---- t = %.2f s (Step %d/%d) ----\r\n", t, step, total_steps);
+    printf("Target Pos : [%.4f, %.4f, %.4f] m\r\n", r_out.x, r_out.y, r_out.z);
+    printf("Target Vel : [%.4f, %.4f, %.4f] m/s\r\n", r_dot_out.x, r_dot_out.y,
+           r_dot_out.z);
+
+    printf("Cable Lens : ");
+    for (int i = 0; i < 8; i++) {
+      printf("%.4f ", all_commands[step][i].L_total);
+    }
+
+    printf("\r\nCable Vels : ");
+    for (int i = 0; i < 8; i++) {
+      printf("%+.4f ", all_commands[step][i].L_dot);
+    }
+
+    printf("\r\nTensions   : ");
+    for (int i = 0; i < 8; i++) {
+      printf("%.2f ", all_commands[step][i].tau);
+    }
+    printf("  [feasible=%s]\r\n\n",
+           all_commands[step][0].feasible ? "true" : "false");
+  }
+
+  printf("===> Pure Kinematics Calculation Time: %lu ms <===\r\n",
+         (unsigned long)elapsed_tick);
+
+  printf("2. Calculations complete. Enabling continuous sending in main "
+         "loop.\r\n");
+  trajectory_ready = true;
+}
+
+static void PrintCanMessage(const char *prefix,
+                            const CAN_BusMessage_t *message) {
   if ((prefix == NULL) || (message == NULL)) {
     return;
   }
 
-  printf("%s id=0x%03lX dlc=%u data:",
-         prefix,
-         (unsigned long)message->id,
+  printf("%s id=0x%03lX dlc=%u data:", prefix, (unsigned long)message->id,
          message->dlc);
 
   for (uint8_t i = 0; i < message->dlc; i++) {
@@ -97,50 +250,51 @@ static void PrintCanMessage(const char *prefix, const CAN_BusMessage_t *message)
   printf("\r\n");
 }
 
-void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *fdcan_handle, uint32_t RxFifo0ITs)
-{
-    if ((fdcan_handle == &CAN) && ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != 0U)) {
-      CAN_BusMessage_t message = {0};
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *fdcan_handle,
+                               uint32_t RxFifo0ITs) {
+  if ((fdcan_handle == &CAN) &&
+      ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != 0U)) {
+    CAN_BusMessage_t message = {0};
 
-      if (CAN_Bus_Receive(&CAN, &message) == HAL_OK) {
-        PrintCanMessage("CAN RX", &message);
+    if (CAN_Bus_Receive(&CAN, &message) == HAL_OK) {
+      PrintCanMessage("CAN RX", &message);
 
-        switch (message.id) {
-          case CAN_ID_ADC_REPORT: {
-            uint32_t absolute_position = CAN_Bus_ReadU32(&message);
-            printf(absolute_position ? "ADC value: %lu\r\n" : "Failed to read ADC value\r\n", (unsigned long)absolute_position);
-            break;
-          }
-          case CAN_ID_STATUS: {
-            char status = (char)CAN_Bus_ReadU8(&message);
-            switch (status) {
-              case 'R':
-                printf("Resetting ....\r\n");
-                HAL_NVIC_SystemReset();
-                break;
-              default:
-                break;
-            }
-            break;
-          }
-          case CAN_ID_DEBUG:
-            printf("Debug value: %lu\r\n", (unsigned long)CAN_Bus_ReadU32(&message));
-            break;
-          default:
-            printf("Received message with unhandled ID: 0x%03lX\r\n", (unsigned long)message.id);
-            break;
+      switch (message.id) {
+      case CAN_ID_ADC_REPORT: {
+        uint32_t absolute_position = CAN_Bus_ReadU32(&message);
+        printf(absolute_position ? "ADC value: %lu\r\n"
+                                 : "Failed to read ADC value\r\n",
+               (unsigned long)absolute_position);
+        break;
+      }
+      case CAN_ID_STATUS: {
+        char status = (char)CAN_Bus_ReadU8(&message);
+        switch (status) {
+        case 'R':
+          printf("Resetting ....\r\n");
+          HAL_NVIC_SystemReset();
+          break;
+        default:
+          break;
         }
+        break;
+      }
+      case CAN_ID_DEBUG:
+        printf("Debug value: %lu\r\n",
+               (unsigned long)CAN_Bus_ReadU32(&message));
+        break;
+      default:
+        printf("Received message with unhandled ID: 0x%03lX\r\n",
+               (unsigned long)message.id);
+        break;
       }
     }
+  }
 }
 
-void REQUEST_SEND_CAN(void)
-{
-  can_send_pending = 1U;
-}
+void REQUEST_SEND_CAN(void) { can_send_pending = 1U; }
 
-void SEND_CAN(void)
-{
+void SEND_CAN(void) {
   if (CAN_Bus_SendU32(&CAN, CAN_ID_DEBUG, canValue) != HAL_OK) {
     FDCAN_ProtocolStatusTypeDef protocol_status = {0};
     (void)HAL_FDCAN_GetProtocolStatus(&CAN, &protocol_status);
@@ -157,11 +311,10 @@ void SEND_CAN(void)
 /* USER CODE END 0 */
 
 /**
-  * @brief  The application entry point.
-  * @retval int
-  */
-int main(void)
-{
+ * @brief  The application entry point.
+ * @retval int
+ */
+int main(void) {
 
   /* USER CODE BEGIN 1 */
   /* USER CODE END 1 */
@@ -171,7 +324,8 @@ int main(void)
   /* Update SystemCoreClock variable according to RCC registers values. */
   SystemCoreClockUpdate();
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick.
+   */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -184,20 +338,21 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  
-  // Note: MX_USART1_UART_Init and MX_USART3_UART_Init must run first to enable debugging output
+
+  // Note: MX_USART1_UART_Init and MX_USART3_UART_Init must run first to enable
+  // debugging output
   MX_USART1_UART_Init();
   MX_USART3_UART_Init();
-  
+
   printf("\r\n--- Main Application Starting ---\r\n");
-  
+
   /* Print Clock Frequencies */
   printf("HSE Value (Assumed): %lu Hz\r\n", HSE_VALUE);
   printf("System Clock (SYSCLK): %lu Hz\r\n", HAL_RCC_GetSysClockFreq());
   printf("AHB Clock (HCLK):      %lu Hz\r\n", HAL_RCC_GetHCLKFreq());
   printf("APB1 Clock (PCLK1):    %lu Hz\r\n", HAL_RCC_GetPCLK1Freq());
   printf("APB2 Clock (PCLK2):    %lu Hz\r\n", HAL_RCC_GetPCLK2Freq());
-  
+
   uint32_t sysclk_source = __HAL_RCC_GET_SYSCLK_SOURCE();
   if (sysclk_source == RCC_SYSCLKSOURCE_STATUS_HSI) {
     printf("SYSCLK Source: Internal HSI (64 MHz)\r\n");
@@ -232,48 +387,74 @@ int main(void)
   printf("All peripherals initialized. Entering main loop...\r\n");
   printf("CAN init : ");
   printf(CAN_Bus_Init(&CAN) ? "Failed\r\n" : "Success\r\n");
+
+  /*
+  printf("Initializing IK Geometry...\r\n");
+  initGeometry();
+  printf("IK Geometry Initialized.\r\n");
+
+  run_ik_test();
+  */
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  printf("\r\n=== UART Bridge Mode Active: PC (UART3) <-> ESP32 (UART1) ===\r\n");
-  
-  uint32_t last_can_send_tick = 0;
-  
-  while (1) {
-    /* Periodically request sending a CAN message every 1000ms */
-    uint32_t current_tick = HAL_GetTick();
-    if (current_tick - last_can_send_tick >= 1000U) {
-      last_can_send_tick = current_tick;
-      REQUEST_SEND_CAN();
-    }
+  printf(
+      "\r\n=== UART Bridge Mode Active: PC (UART3) <-> ESP32 (UART1) ===\r\n");
 
-    if (can_send_pending != 0U) {
-      can_send_pending = 0U;
-      SEND_CAN();
+  uint32_t last_test_send_tick = 0;
+  MotorCommand_t dummy_cmds[4];
+  for (int i = 0; i < 4; i++) {
+    dummy_cmds[i].L_total = 1.0f + (i * 0.1f); // 1.0m, 1.1m, 1.2m, 1.3m
+    dummy_cmds[i].L_dot = 0.0f;                // 0.0 m/s velocity
+    dummy_cmds[i].tau = 10.0f * (i + 1);       // 10N, 20N, 30N, 40N
+  }
+
+  while (1) {
+    /* Send test commands to the 4 motors periodically */
+    if (HAL_GetTick() - last_test_send_tick >= 500) {
+      last_test_send_tick = HAL_GetTick();
+      HAL_StatusTypeDef status = SendMotorCommands(dummy_cmds);
+      if (status == HAL_OK) {
+        printf("Sent test commands to motors 1, 2, 4, 8 successfully\r\n");
+      } else {
+        FDCAN_ProtocolStatusTypeDef protocol_status = {0};
+        (void)HAL_FDCAN_GetProtocolStatus(&CAN, &protocol_status);
+        printf(
+            "Failed to send test commands! err=0x%08lX lec=%lu bus_off=%lu\r\n",
+            (unsigned long)HAL_FDCAN_GetError(&CAN),
+            (unsigned long)protocol_status.LastErrorCode,
+            (unsigned long)protocol_status.BusOff);
+      }
     }
 
     /* Clear any UART errors on USART1 (ESP32) */
-    if (USART1->ISR & (USART_ISR_ORE | USART_ISR_NE | USART_ISR_FE | USART_ISR_PE)) {
-      USART1->ICR = USART_ICR_ORECF | USART_ICR_NECF | USART_ICR_FECF | USART_ICR_PECF;
+    if (USART1->ISR &
+        (USART_ISR_ORE | USART_ISR_NE | USART_ISR_FE | USART_ISR_PE)) {
+      USART1->ICR =
+          USART_ICR_ORECF | USART_ICR_NECF | USART_ICR_FECF | USART_ICR_PECF;
     }
 
     /* Clear any UART errors on USART3 (PC) */
-    if (USART3->ISR & (USART_ISR_ORE | USART_ISR_NE | USART_ISR_FE | USART_ISR_PE)) {
-      USART3->ICR = USART_ICR_ORECF | USART_ICR_NECF | USART_ICR_FECF | USART_ICR_PECF;
+    if (USART3->ISR &
+        (USART_ISR_ORE | USART_ISR_NE | USART_ISR_FE | USART_ISR_PE)) {
+      USART3->ICR =
+          USART_ICR_ORECF | USART_ICR_NECF | USART_ICR_FECF | USART_ICR_PECF;
     }
 
     /* Forward data from PC (USART3) to ESP32 (USART1) */
     if (USART3->ISR & USART_ISR_RXNE_RXFNE) {
       uint8_t byte = USART3->RDR;
-      while (!(USART1->ISR & USART_ISR_TXE_TXFNF));
+      while (!(USART1->ISR & USART_ISR_TXE_TXFNF))
+        ;
       USART1->TDR = byte;
     }
 
     /* Forward data from ESP32 (USART1) to PC (USART3) */
     if (USART1->ISR & USART_ISR_RXNE_RXFNE) {
       uint8_t byte = USART1->RDR;
-      while (!(USART3->ISR & USART_ISR_TXE_TXFNF));
+      while (!(USART3->ISR & USART_ISR_TXE_TXFNF))
+        ;
       USART3->TDR = byte;
     }
 
@@ -285,12 +466,11 @@ int main(void)
 }
 
 /**
-  * @brief FDCAN1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_FDCAN1_Init(void)
-{
+ * @brief FDCAN1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_FDCAN1_Init(void) {
 
   /* USER CODE BEGIN FDCAN1_Init 0 */
 
@@ -303,7 +483,7 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
   hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
   hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
-  hfdcan1.Init.AutoRetransmission = ENABLE;
+  hfdcan1.Init.AutoRetransmission = DISABLE;
   hfdcan1.Init.TransmitPause = ENABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
   hfdcan1.Init.NominalPrescaler = 3;
@@ -314,26 +494,23 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.DataSyncJumpWidth = 1;
   hfdcan1.Init.DataTimeSeg1 = 1;
   hfdcan1.Init.DataTimeSeg2 = 1;
-  hfdcan1.Init.StdFiltersNbr = 1;
+  hfdcan1.Init.StdFiltersNbr = 2;
   hfdcan1.Init.ExtFiltersNbr = 0;
   hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
-  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
-  {
+  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN FDCAN1_Init 2 */
 
   /* USER CODE END FDCAN1_Init 2 */
-
 }
 
 /**
-  * @brief USART1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART1_UART_Init(void)
-{
+ * @brief USART1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_USART1_UART_Init(void) {
 
   /* USER CODE BEGIN USART1_Init 0 */
 
@@ -353,35 +530,31 @@ static void MX_USART1_UART_Init(void)
   huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
   huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart1) != HAL_OK)
-  {
+  if (HAL_UART_Init(&huart1) != HAL_OK) {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) !=
+      HAL_OK) {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) !=
+      HAL_OK) {
     Error_Handler();
   }
-  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
-  {
+  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN USART1_Init 2 */
 
   /* USER CODE END USART1_Init 2 */
-
 }
 
 /**
-  * @brief USART3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART3_UART_Init(void)
-{
+ * @brief USART3 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_USART3_UART_Init(void) {
 
   /* USER CODE BEGIN USART3_Init 0 */
 
@@ -401,35 +574,31 @@ static void MX_USART3_UART_Init(void)
   huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart3.Init.ClockPrescaler = UART_PRESCALER_DIV1;
   huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart3) != HAL_OK)
-  {
+  if (HAL_UART_Init(&huart3) != HAL_OK) {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) !=
+      HAL_OK) {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
-  {
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) !=
+      HAL_OK) {
     Error_Handler();
   }
-  if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK)
-  {
+  if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN USART3_Init 2 */
 
   /* USER CODE END USART3_Init 2 */
-
 }
 
 /**
-  * @brief XSPI1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_XSPI1_Init(void)
-{
+ * @brief XSPI1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_XSPI1_Init(void) {
 
   /* USER CODE BEGIN XSPI1_Init 0 */
 
@@ -456,30 +625,27 @@ static void MX_XSPI1_Init(void)
   hxspi1.Init.MaxTran = 0;
   hxspi1.Init.Refresh = 0;
   hxspi1.Init.MemorySelect = HAL_XSPI_CSSEL_NCS1;
-  if (HAL_XSPI_Init(&hxspi1) != HAL_OK)
-  {
+  if (HAL_XSPI_Init(&hxspi1) != HAL_OK) {
     Error_Handler();
   }
   sXspiManagerCfg.nCSOverride = HAL_XSPI_CSSEL_OVR_NCS1;
   sXspiManagerCfg.IOPort = HAL_XSPIM_IOPORT_1;
   sXspiManagerCfg.Req2AckTime = 1;
-  if (HAL_XSPIM_Config(&hxspi1, &sXspiManagerCfg, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK)
-  {
+  if (HAL_XSPIM_Config(&hxspi1, &sXspiManagerCfg,
+                       HAL_XSPI_TIMEOUT_DEFAULT_VALUE) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN XSPI1_Init 2 */
 
   /* USER CODE END XSPI1_Init 2 */
-
 }
 
 /**
-  * @brief USB_OTG_HS Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USB_OTG_HS_PCD_Init(void)
-{
+ * @brief USB_OTG_HS Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_USB_OTG_HS_PCD_Init(void) {
 
   /* USER CODE BEGIN USB_OTG_HS_PCD_Init 0 */
 
@@ -499,24 +665,21 @@ static void MX_USB_OTG_HS_PCD_Init(void)
   hpcd_USB_OTG_HS.Init.use_dedicated_ep1 = DISABLE;
   hpcd_USB_OTG_HS.Init.vbus_sensing_enable = DISABLE;
   HAL_StatusTypeDef status = HAL_PCD_Init(&hpcd_USB_OTG_HS);
-  if (status != HAL_OK)
-  {
+  if (status != HAL_OK) {
     printf("HAL_PCD_Init failed! Status: %d\r\n", status);
     Error_Handler();
   }
   /* USER CODE BEGIN USB_OTG_HS_PCD_Init 2 */
 
   /* USER CODE END USB_OTG_HS_PCD_Init 2 */
-
 }
 
 /**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
+ * @brief GPIO Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_GPIO_Init(void) {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
@@ -558,11 +721,10 @@ int __io_putchar(int ch) {
 /* USER CODE END 4 */
 
 /**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
-{
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
+void Error_Handler(void) {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   printf("\r\n!!! ERROR_HANDLER CALLED - SYSTEM HALTING !!!\r\n");
@@ -573,14 +735,13 @@ void Error_Handler(void)
 }
 #ifdef USE_FULL_ASSERT
 /**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
+ * @brief  Reports the name of the source file and the source line number
+ *         where the assert_param error has occurred.
+ * @param  file: pointer to the source file name
+ * @param  line: assert_param error line source number
+ * @retval None
+ */
+void assert_failed(uint8_t *file, uint32_t line) {
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line
      number, ex: printf("Wrong parameters value: file %s on line %d\r\n", file,

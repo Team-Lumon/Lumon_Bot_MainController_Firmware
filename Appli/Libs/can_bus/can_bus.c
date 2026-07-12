@@ -89,19 +89,29 @@ HAL_StatusTypeDef CAN_Bus_Init(FDCAN_HandleTypeDef *hfdcan)
         return HAL_ERROR;
     }
 
+    /* Match only destination bits 3:0; ignore priority and message ID. */
+    /* Target Device ID: 0x0 (Main Controller) */
     filter.IdType = FDCAN_STANDARD_ID;
-    filter.FilterIndex = 0;
     filter.FilterType = FDCAN_FILTER_MASK;
     filter.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+    filter.FilterIndex = 0;
     filter.FilterID1 = 0x000U;
-    filter.FilterID2 = 0x000U;
+    filter.FilterID2 = 0x00FU;
+
+    if (HAL_FDCAN_ConfigFilter(hfdcan, &filter) != HAL_OK) {
+        return HAL_ERROR;
+    }
+
+    /* Match broadcast destination 0xF using the same lower-four-bit mask. */
+    filter.FilterIndex = 1;
+    filter.FilterID1 = CAN_DEST_BROADCAST_ID;
 
     if (HAL_FDCAN_ConfigFilter(hfdcan, &filter) != HAL_OK) {
         return HAL_ERROR;
     }
 
     if (HAL_FDCAN_ConfigGlobalFilter(hfdcan,
-                                     FDCAN_ACCEPT_IN_RX_FIFO0,
+                                     FDCAN_REJECT,
                                      FDCAN_REJECT,
                                      FDCAN_REJECT_REMOTE,
                                      FDCAN_REJECT_REMOTE) != HAL_OK) {
@@ -162,6 +172,21 @@ HAL_StatusTypeDef CAN_Bus_SendU32(FDCAN_HandleTypeDef *hfdcan, uint16_t id, uint
     CAN_BusMessage_t message;
 
     CAN_Bus_BuildU32(&message, id, value);
+    return CAN_Bus_SendMessage(hfdcan, &message);
+}
+
+HAL_StatusTypeDef CAN_Bus_SendRaw(FDCAN_HandleTypeDef *hfdcan, uint16_t id, const uint8_t *data, uint8_t len)
+{
+    if ((data == NULL) || (len > 8U)) {
+        return HAL_ERROR;
+    }
+
+    CAN_BusMessage_t message;
+    memset(&message, 0, sizeof(message));
+    message.id = id;
+    message.dlc = len;
+    memcpy(message.data, data, len);
+
     return CAN_Bus_SendMessage(hfdcan, &message);
 }
 
