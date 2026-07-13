@@ -58,6 +58,7 @@ PCD_HandleTypeDef hpcd_USB_OTG_HS;
 static volatile uint8_t can_send_pending;
 uint32_t canValue = 0;
 static MotorCommand_t all_commands[151][8];
+static float all_deltas[151][8];
 static int total_steps = 150;
 static int current_send_step = 0;
 static bool trajectory_ready = false;
@@ -76,25 +77,25 @@ static void MX_XSPI1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-HAL_StatusTypeDef SendMotorCommands(const MotorCommand_t *commands) {
-  if (commands == NULL)
+HAL_StatusTypeDef SendMotorCommands(const MotorCommand_t *commands, const float *deltas) {
+  if (commands == NULL || deltas == NULL)
     return HAL_ERROR;
 
-  static const uint16_t motor_ids[4] = {1, 2, 4, 8};
+  static const uint16_t motor_ids[4] = {1, 2, 4, 3};
   HAL_StatusTypeDef overall_status = HAL_OK;
 
   for (int i = 0; i < 4; i++) {
-    // 1. Scale L_total to uint16_t (in 1.0 mm resolution).
-    float len_mm = commands[i].L_total * 1000.0f;
-    if (len_mm < 0.0f)
-      len_mm = 0.0f;
-    if (len_mm > 4095.0f)
-      len_mm = 4095.0f;
-    uint16_t len_u12 = (uint16_t)len_mm;
 
-    // 2. Scale L_dot (velocity) to signed 12-bit int (range -2048 to 2047, 1.0
-    // mm/s per LSb).
-    float vel_scaled = commands[i].L_dot * 1000.0f;
+    // 1. Use the pre-calculated delta length (difference) in mm.
+    float len_mm = -deltas[i];
+    if (len_mm < -2048.0f)
+      len_mm = -2048.0f;
+    if (len_mm > 2047.0f)
+      len_mm = 2047.0f;
+    int16_t len_s12 = (int16_t)len_mm;
+
+    // 2. Scale L_dot (velocity) to signed 12-bit int, scaled by 10,000
+    float vel_scaled = -commands[i].L_dot * 10000.0f;
     if (vel_scaled < -2048.0f)
       vel_scaled = -2048.0f;
     if (vel_scaled > 2047.0f)
@@ -110,14 +111,14 @@ HAL_StatusTypeDef SendMotorCommands(const MotorCommand_t *commands) {
     uint8_t tension_u8 = (uint8_t)tension_n;
 
     // 4. Bit-pack into 32-bit word:
-    // Bits 0..11: len_u12
+    // Bits 0..11: len_s12
     // Bits 12..23: vel_s12
     // Bits 24..31: tension_u8
     uint32_t packed_val = 0;
-    packed_val |= ((uint32_t)(len_u12 & 0xFFFU)) << 0;
+    packed_val |= ((uint32_t)(len_s12 & 0xFFFU)) << 0;
     packed_val |= ((uint32_t)(vel_s12 & 0xFFFU)) << 12;
     packed_val |= ((uint32_t)tension_u8) << 24;
-    
+
     // 5. Send the CAN message exactly like the Motor Driver format (4 bytes /
     // 32 bits) The updated CAN library handles the 11-bit ID creation
     // internally based on these arguments!
@@ -145,10 +146,10 @@ HAL_StatusTypeDef SendMotorCommands(const MotorCommand_t *commands) {
 
 void run_ik_test(void) {
   printf("\r\n=== Running IK Trajectory Test ===\r\n");
-  Vector3_t r_start = {0.46f, 0.56f, 0.7f};
-  Vector3_t r_end = {0.50f, 0.3f, 0.30f};
+  Vector3_t r_start = {0.46f, 0.46f, 0.0f};
+  Vector3_t r_end = {0.46f, 0.46f, 0.7f};
 
-  float T_MOVE = 10.0f;
+  float T_MOVE = 5.0f;
   float FRAME_DT = 0.1f;
 
   total_steps = (int)(T_MOVE / FRAME_DT);
@@ -167,6 +168,15 @@ void run_ik_test(void) {
 
     computeFrameTargetsWrapper(t, &r_start, &r_end, all_commands[step], &r_out,
                                &r_dot_out);
+
+    // Calculate the difference: present - previous, scaled by 500,000
+    for (int i = 0; i < 4; i++) {
+      if (step == 0) {
+        all_deltas[step][i] = 0.0f;
+      } else {
+        all_deltas[step][i] = (all_commands[step][i].L_total - all_commands[step-1][i].L_total) * 100000.0f;
+      }
+    }
   }
   uint32_t elapsed_tick = HAL_GetTick() - start_tick;
 
@@ -187,17 +197,17 @@ void run_ik_test(void) {
            r_dot_out.z);
 
     printf("Cable Lens : ");
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 4; i++) {
       printf("%.4f ", all_commands[step][i].L_total);
     }
 
     printf("\r\nCable Vels : ");
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 4; i++) {
       printf("%+.4f ", all_commands[step][i].L_dot);
     }
 
     printf("\r\nTensions   : ");
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 4; i++) {
       printf("%.2f ", all_commands[step][i].tau);
     }
     printf("  [feasible=%s]\r\n\n",
@@ -376,13 +386,12 @@ int main(void) {
   printf("CAN init : ");
   printf(CAN_Bus_Init(&CAN, 0x00) ? "Failed\r\n" : "Success\r\n");
 
-  /*
   printf("Initializing IK Geometry...\r\n");
   initGeometry();
   printf("IK Geometry Initialized.\r\n");
 
   run_ik_test();
-  */
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -390,22 +399,16 @@ int main(void) {
   printf(
       "\r\n=== UART Bridge Mode Active: PC (UART3) <-> ESP32 (UART1) ===\r\n");
 
-  uint32_t last_test_send_tick = 0;
-  MotorCommand_t dummy_cmds[4];
-  for (int i = 0; i < 4; i++) {
-    dummy_cmds[i].L_total = 1.0f + (i * 0.1f); // 1.0m, 1.1m, 1.2m, 1.3m
-    dummy_cmds[i].L_dot = 0.0f;                // 0.0 m/s velocity
-    dummy_cmds[i].tau = 10.0f * (i + 1);       // 10N, 20N, 30N, 40N
-  }
+  uint32_t last_sync_tick = HAL_GetTick();
+  uint8_t sync_index = 0;
+
+  printf("\r\n--- RUNNING WITH 100MS (10Hz) SYNC TIMER ---\r\n");
 
   while (1) {
-    /* Send test commands to the 4 motors periodically */
-    if (HAL_GetTick() - last_test_send_tick >= 500) {
-      last_test_send_tick = HAL_GetTick();
-      HAL_StatusTypeDef status = SendMotorCommands(dummy_cmds);
-      if (status == HAL_OK) {
-        printf("Sent test commands to motors 1, 2, 4, 8 successfully\r\n");
-      } else {
+    if (trajectory_ready && current_send_step <= total_steps) {
+      HAL_StatusTypeDef status =
+          SendMotorCommands(all_commands[current_send_step], all_deltas[current_send_step]);
+      if (status != HAL_OK) {
         FDCAN_ProtocolStatusTypeDef protocol_status = {0};
         (void)HAL_FDCAN_GetProtocolStatus(&CAN, &protocol_status);
         printf(
@@ -413,6 +416,17 @@ int main(void) {
             (unsigned long)HAL_FDCAN_GetError(&CAN),
             (unsigned long)protocol_status.LastErrorCode,
             (unsigned long)protocol_status.BusOff);
+      }
+      current_send_step++;
+    }
+
+    /* 2. Send a SYNC message exactly every 100ms */
+    if (HAL_GetTick() - last_sync_tick >= 100) {
+      last_sync_tick = HAL_GetTick();
+
+      if (trajectory_ready && sync_index <= total_steps) {
+        CAN_Bus_SendU8(&CAN, 0x0F, CAN_ID_SYNC, CAN_Priority_HIGH, sync_index);
+        sync_index++;
       }
     }
 

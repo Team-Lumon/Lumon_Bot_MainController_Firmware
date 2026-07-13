@@ -160,6 +160,9 @@ double solve_quadprog(LLT<MatrixXd, Lower>& chol, double c1, VectorXd& g0,
 
 l1:
   iter++;
+  if (iter > 500) {
+    return std::numeric_limits<double>::infinity();
+  }
 #ifdef EIQGUADPROG_TRACE_SOLVER
   utils::print_vector("x", x);
 #endif
@@ -221,6 +224,10 @@ l2: /* Step 2: check for feasibility and determine a new S-pair */
 #endif
 
 l2a: /* Step 2a: determine step direction */
+  iter++;
+  if (iter > 500) {
+    return std::numeric_limits<double>::infinity();
+  }
   /* compute z = H np: the step direction in the primal space (through J, see
    * the paper) */
   compute_d(d, J, np);
