@@ -149,7 +149,7 @@ void run_ik_test(void) {
   Vector3_t r_start = {0.46f, 0.46f, 0.0f};
   Vector3_t r_end = {0.46f, 0.46f, 0.7f};
 
-  float T_MOVE = 5.0f;
+  float T_MOVE = 10.0f;
   float FRAME_DT = 0.1f;
 
   total_steps = (int)(T_MOVE / FRAME_DT);
@@ -400,6 +400,7 @@ int main(void) {
       "\r\n=== UART Bridge Mode Active: PC (UART3) <-> ESP32 (UART1) ===\r\n");
 
   uint32_t last_sync_tick = HAL_GetTick();
+  uint32_t last_esp_ping_tick = HAL_GetTick();
   uint8_t sync_index = 0;
 
   printf("\r\n--- RUNNING WITH 100MS (10Hz) SYNC TIMER ---\r\n");
@@ -427,6 +428,17 @@ int main(void) {
       if (trajectory_ready && sync_index <= total_steps) {
         CAN_Bus_SendU8(&CAN, 0x0F, CAN_ID_SYNC, CAN_Priority_HIGH, sync_index);
         sync_index++;
+      }
+    }
+
+    /* 2.5. Send a ping to the ESP32 (USART1) every 1000ms */
+    if (HAL_GetTick() - last_esp_ping_tick >= 1000) {
+      last_esp_ping_tick = HAL_GetTick();
+      const char *ping_msg = "STM32_PING\r\n";
+      for (int i = 0; ping_msg[i] != '\0'; i++) {
+        while (!(USART1->ISR & USART_ISR_TXE_TXFNF))
+          ;
+        USART1->TDR = ping_msg[i];
       }
     }
 
