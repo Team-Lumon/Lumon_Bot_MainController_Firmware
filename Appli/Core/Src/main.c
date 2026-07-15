@@ -55,6 +55,7 @@ XSPI_HandleTypeDef hxspi1;
 PCD_HandleTypeDef hpcd_USB_OTG_HS;
 
 /* USER CODE BEGIN PV */
+volatile uint8_t estop_triggered = 0;
 static volatile uint8_t can_send_pending;
 uint32_t canValue = 0;
 static MotorCommand_t all_commands[151][8];
@@ -132,9 +133,9 @@ HAL_StatusTypeDef SendMotorCommands(const MotorCommand_t *commands, const float 
     // Check if transmission completed successfully (ACKed) via TXBTO register
     bool acked = (hfdcan1.Instance->TXBTO & active_buffer_mask) != 0U;
 
-    printf("  Motor %u: %s (ACK: %s)\r\n", motor_ids[i],
-           (status == HAL_OK) ? "Queued OK" : "Queue FULL",
-           acked ? "YES" : "NO");
+//    printf("  Motor %u: %s (ACK: %s)\r\n", motor_ids[i],
+//           (status == HAL_OK) ? "Queued OK" : "Queue FULL",
+//           acked ? "YES" : "NO");
 
     if (status != HAL_OK) {
       overall_status = status;
@@ -181,38 +182,38 @@ void run_ik_test(void) {
   uint32_t elapsed_tick = HAL_GetTick() - start_tick;
 
   // Print details to the console now that timing is complete
-  for (int step = 0; step <= total_steps; ++step) {
-    float t = step * FRAME_DT;
-    if (t > T_MOVE)
-      t = T_MOVE;
+  // for (int step = 0; step <= total_steps; ++step) {
+  //   float t = step * FRAME_DT;
+  //   if (t > T_MOVE)
+  //     t = T_MOVE;
 
-    // We already calculated this, but we extract the position and velocity for
-    // printing
-    computeFrameTargetsWrapper(t, &r_start, &r_end, all_commands[step], &r_out,
-                               &r_dot_out);
+  //   // We already calculated this, but we extract the position and velocity for
+  //   // printing
+  //   computeFrameTargetsWrapper(t, &r_start, &r_end, all_commands[step], &r_out,
+  //                              &r_dot_out);
 
-    printf("---- t = %.2f s (Step %d/%d) ----\r\n", t, step, total_steps);
-    printf("Target Pos : [%.4f, %.4f, %.4f] m\r\n", r_out.x, r_out.y, r_out.z);
-    printf("Target Vel : [%.4f, %.4f, %.4f] m/s\r\n", r_dot_out.x, r_dot_out.y,
-           r_dot_out.z);
+  //   printf("---- t = %.2f s (Step %d/%d) ----\r\n", t, step, total_steps);
+  //   printf("Target Pos : [%.4f, %.4f, %.4f] m\r\n", r_out.x, r_out.y, r_out.z);
+  //   printf("Target Vel : [%.4f, %.4f, %.4f] m/s\r\n", r_dot_out.x, r_dot_out.y,
+  //          r_dot_out.z);
 
-    printf("Cable Lens : ");
-    for (int i = 0; i < 4; i++) {
-      printf("%.4f ", all_commands[step][i].L_total);
-    }
+  //   printf("Cable Lens : ");
+  //   for (int i = 0; i < 4; i++) {
+  //     printf("%.4f ", all_commands[step][i].L_total);
+  //   }
 
-    printf("\r\nCable Vels : ");
-    for (int i = 0; i < 4; i++) {
-      printf("%+.4f ", all_commands[step][i].L_dot);
-    }
+  //   printf("\r\nCable Vels : ");
+  //   for (int i = 0; i < 4; i++) {
+  //     printf("%+.4f ", all_commands[step][i].L_dot);
+  //   }
 
-    printf("\r\nTensions   : ");
-    for (int i = 0; i < 4; i++) {
-      printf("%.2f ", all_commands[step][i].tau);
-    }
-    printf("  [feasible=%s]\r\n\n",
-           all_commands[step][0].feasible ? "true" : "false");
-  }
+  //   printf("\r\nTensions   : ");
+  //   for (int i = 0; i < 4; i++) {
+  //     printf("%.2f ", all_commands[step][i].tau);
+  //   }
+  //   printf("  [feasible=%s]\r\n\n",
+  //          all_commands[step][0].feasible ? "true" : "false");
+  // }
 
   printf("===> Pure Kinematics Calculation Time: %lu ms <===\r\n",
          (unsigned long)elapsed_tick);
@@ -406,7 +407,7 @@ int main(void) {
   printf("\r\n--- RUNNING WITH 100MS (10Hz) SYNC TIMER ---\r\n");
 
   while (1) {
-    if (trajectory_ready && current_send_step <= total_steps) {
+    if (!estop_triggered && trajectory_ready && current_send_step <= total_steps) {
       HAL_StatusTypeDef status =
           SendMotorCommands(all_commands[current_send_step], all_deltas[current_send_step]);
       if (status != HAL_OK) {
@@ -422,7 +423,7 @@ int main(void) {
     }
 
     /* 2. Send a SYNC message exactly every 100ms */
-    if (HAL_GetTick() - last_sync_tick >= 100) {
+    if (!estop_triggered && (HAL_GetTick() - last_sync_tick >= 100)) {
       last_sync_tick = HAL_GetTick();
 
       if (trajectory_ready && sync_index <= total_steps) {
@@ -722,6 +723,10 @@ static void MX_GPIO_Init(void) {
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(EStop_GPIO_Port, &GPIO_InitStruct);
 
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI5_IRQn);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
@@ -731,6 +736,14 @@ static void MX_GPIO_Init(void) {
 int __io_putchar(int ch) {
   HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
   return ch;
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+  if (GPIO_Pin == EStop_Pin) {
+    estop_triggered = 1;
+    CAN_Bus_SendU8(&CAN, CAN_BROADCAST_ID, CAN_ID_EMERGENCY, CAN_Priority_VERY_HIGH, 0x00);
+    printf("E-STOP Triggered! Emergency CAN message sent.\r\n");
+  }
 }
 /* USER CODE END 4 */
 

@@ -161,11 +161,11 @@ static HAL_StatusTypeDef CAN_Bus_SendMessage(FDCAN_HandleTypeDef *hfdcan,
     tx_header.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
     tx_header.MessageMarker = 0U;
 
-    printf("CAN_TX [ID: 0x%03lX] DLC: %lu Data: ", (unsigned long)tx_header.Identifier, (unsigned long)message->dlc);
-    for (uint8_t i = 0; i < message->dlc; i++) {
-        printf("%02X ", message->data[i]);
-    }
-    printf("\r\n");
+//    printf("CAN_TX [ID: 0x%03lX] DLC: %lu Data: ", (unsigned long)tx_header.Identifier, (unsigned long)message->dlc);
+//    for (uint8_t i = 0; i < message->dlc; i++) {
+//        printf("%02X ", message->data[i]);
+//    }
+//    printf("\r\n");
 
     return HAL_FDCAN_AddMessageToTxFifoQ(hfdcan, &tx_header, (uint8_t *)message->data);
 }
