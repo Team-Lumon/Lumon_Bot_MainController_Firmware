@@ -63,6 +63,16 @@ static float all_deltas[151][8];
 static int total_steps = 150;
 static int current_send_step = 0;
 static bool trajectory_ready = false;
+Vector3_t r_current = {0.46f, 0.46f, 0.0f};
+static int sync_index = 0;
+static Vector3_t points[3] = {
+    {0.465f, 0.445f, 0.1f}, // Start
+    {0.465f, 0.25f, 0.2f},  // Pos 1
+    {0.465f, 0.25f, 0.6f}   // Pos 2
+};
+static int current_segment = 0;
+static bool in_delay = false;
+static uint32_t delay_start_tick = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -78,14 +88,15 @@ static void MX_XSPI1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-HAL_StatusTypeDef SendMotorCommands(const MotorCommand_t *commands, const float *deltas) {
+HAL_StatusTypeDef SendMotorCommands(const MotorCommand_t *commands,
+                                    const float *deltas) {
   if (commands == NULL || deltas == NULL)
     return HAL_ERROR;
 
-  static const uint16_t motor_ids[4] = {1, 2, 4, 3};
+  static const uint16_t motor_ids[8] = {1, 2, 3, 4, 5, 6, 7, 8};
   HAL_StatusTypeDef overall_status = HAL_OK;
 
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 8; i++) {
 
     // 1. Use the pre-calculated delta length (difference) in mm.
     float len_mm = -deltas[i];
@@ -133,9 +144,11 @@ HAL_StatusTypeDef SendMotorCommands(const MotorCommand_t *commands, const float 
     // Check if transmission completed successfully (ACKed) via TXBTO register
     bool acked = (hfdcan1.Instance->TXBTO & active_buffer_mask) != 0U;
 
-//    printf("  Motor %u: %s (ACK: %s)\r\n", motor_ids[i],
-//           (status == HAL_OK) ? "Queued OK" : "Queue FULL",
-//           acked ? "YES" : "NO");
+    printf("CAN Tx command -> Motor ID %u: Packed: 0x%08lX (Status: %s, ACK: "
+           "%s)\r\n",
+           motor_ids[i], (unsigned long)packed_val,
+           (status == HAL_OK) ? "Queued OK" : "Queue FULL",
+           acked ? "YES" : "NO");
 
     if (status != HAL_OK) {
       overall_status = status;
@@ -145,11 +158,7 @@ HAL_StatusTypeDef SendMotorCommands(const MotorCommand_t *commands, const float 
   return overall_status;
 }
 
-void run_ik_test(void) {
-  printf("\r\n=== Running IK Trajectory Test ===\r\n");
-  Vector3_t r_start = {0.46f, 0.46f, 0.0f};
-  Vector3_t r_end = {0.46f, 0.46f, 0.7f};
-
+void compute_trajectory(Vector3_t start, Vector3_t end) {
   float T_MOVE = 10.0f;
   float FRAME_DT = 0.1f;
 
@@ -159,7 +168,7 @@ void run_ik_test(void) {
 
   Vector3_t r_out, r_dot_out;
 
-  printf("1. Pre-calculating all trajectory steps...\r\n");
+  printf("Pre-calculating all trajectory steps...\r\n");
 
   uint32_t start_tick = HAL_GetTick();
   for (int step = 0; step <= total_steps; ++step) {
@@ -167,59 +176,94 @@ void run_ik_test(void) {
     if (t > T_MOVE)
       t = T_MOVE;
 
-    computeFrameTargetsWrapper(t, &r_start, &r_end, all_commands[step], &r_out,
+    computeFrameTargetsWrapper(t, &start, &end, all_commands[step], &r_out,
                                &r_dot_out);
 
-    // Calculate the difference: present - previous, scaled by 500,000
-    for (int i = 0; i < 4; i++) {
+    // Calculate the difference: present - previous, scaled by 100,000
+    for (int i = 0; i < 8; i++) {
       if (step == 0) {
         all_deltas[step][i] = 0.0f;
       } else {
-        all_deltas[step][i] = (all_commands[step][i].L_total - all_commands[step-1][i].L_total) * 100000.0f;
+        all_deltas[step][i] = (all_commands[step][i].L_total -
+                               all_commands[step - 1][i].L_total) *
+                              100000.0f;
       }
     }
   }
   uint32_t elapsed_tick = HAL_GetTick() - start_tick;
 
   // Print details to the console now that timing is complete
-  // for (int step = 0; step <= total_steps; ++step) {
-  //   float t = step * FRAME_DT;
-  //   if (t > T_MOVE)
-  //     t = T_MOVE;
+  /*
+  for (int step = 0; step <= total_steps; ++step) {
+    float t = step * FRAME_DT;
+    if (t > T_MOVE)
+      t = T_MOVE;
 
-  //   // We already calculated this, but we extract the position and velocity for
-  //   // printing
-  //   computeFrameTargetsWrapper(t, &r_start, &r_end, all_commands[step], &r_out,
-  //                              &r_dot_out);
+    computeFrameTargetsWrapper(t, &start, &end, all_commands[step], &r_out,
+                               &r_dot_out);
 
-  //   printf("---- t = %.2f s (Step %d/%d) ----\r\n", t, step, total_steps);
-  //   printf("Target Pos : [%.4f, %.4f, %.4f] m\r\n", r_out.x, r_out.y, r_out.z);
-  //   printf("Target Vel : [%.4f, %.4f, %.4f] m/s\r\n", r_dot_out.x, r_dot_out.y,
-  //          r_dot_out.z);
+    printf("---- t = %.2f s (Step %d/%d) ----\r\n", t, step, total_steps);
+    printf("Target Pos : [%.4f, %.4f, %.4f] m\r\n", r_out.x, r_out.y, r_out.z);
+    printf("Target Vel : [%.4f, %.4f, %.4f] m/s\r\n", r_dot_out.x, r_dot_out.y,
+           r_dot_out.z);
 
-  //   printf("Cable Lens : ");
-  //   for (int i = 0; i < 4; i++) {
-  //     printf("%.4f ", all_commands[step][i].L_total);
-  //   }
+    printf("Cable Lens : ");
+    for (int i = 0; i < 8; i++) {
+      printf("%.4f ", all_commands[step][i].L_total);
+    }
 
-  //   printf("\r\nCable Vels : ");
-  //   for (int i = 0; i < 4; i++) {
-  //     printf("%+.4f ", all_commands[step][i].L_dot);
-  //   }
+    printf("\r\nCable Vels : ");
+    for (int i = 0; i < 8; i++) {
+      printf("%+.4f ", all_commands[step][i].L_dot);
+    }
 
-  //   printf("\r\nTensions   : ");
-  //   for (int i = 0; i < 4; i++) {
-  //     printf("%.2f ", all_commands[step][i].tau);
-  //   }
-  //   printf("  [feasible=%s]\r\n\n",
-  //          all_commands[step][0].feasible ? "true" : "false");
-  // }
+    printf("\r\nTensions   : ");
+    for (int i = 0; i < 8; i++) {
+      printf("%.2f ", all_commands[step][i].tau);
+    }
+    printf("  [feasible=%s]\r\n\n",
+           all_commands[step][0].feasible ? "true" : "false");
+  }
+  */
 
   printf("===> Pure Kinematics Calculation Time: %lu ms <===\r\n",
          (unsigned long)elapsed_tick);
 
-  printf("2. Calculations complete. Enabling continuous sending in main "
-         "loop.\r\n");
+  current_send_step = 0;
+  sync_index = 0;
+}
+
+void run_ik_test(void) {
+  printf("\r\n=== Running IK Trajectory Test ===\r\n");
+  Vector3_t r_start = points[0];
+  Vector3_t r_end = points[1];
+
+  compute_trajectory(r_start, r_end);
+  // r_current = r_end;
+
+  // Array of target initialization ticks for motors 1 through 8
+  static const uint16_t init_ticks[8] = {3772, 867, 334, 722,
+                                         1781, 246, 522, 876};
+
+  printf("Sending individual pre-tension ticks to each motor...\r\n");
+  for (int i = 0; i < 8; i++) {
+    // Send standard init command to the respective motor
+    CAN_Bus_SendU16(&CAN, (uint8_t)(i + 1), CAN_INIT, CAN_Priority_HIGH,
+                    init_ticks[i]);
+    HAL_Delay(5);
+  }
+
+  //  printf("Enabling motors...\r\n");
+  //  // Enable the motors (e.g. config message or status request)
+  //  for (int i = 0; i < 8; i++) {
+  //    CAN_Bus_SendU16(&CAN, (uint8_t)(i + 1), CAN_INIT, CAN_Priority_HIGH,
+  //    0x0); HAL_Delay(5);
+  //  }
+
+  printf(
+      "\r\nSetup complete. Waiting 2 seconds for motors to pre-tension...\r\n");
+  HAL_Delay(2000);
+
   trajectory_ready = true;
 }
 
@@ -402,14 +446,13 @@ int main(void) {
 
   uint32_t last_sync_tick = HAL_GetTick();
   uint32_t last_esp_ping_tick = HAL_GetTick();
-  uint8_t sync_index = 0;
-
   printf("\r\n--- RUNNING WITH 100MS (10Hz) SYNC TIMER ---\r\n");
 
   while (1) {
-    if (!estop_triggered && trajectory_ready && current_send_step <= total_steps) {
-      HAL_StatusTypeDef status =
-          SendMotorCommands(all_commands[current_send_step], all_deltas[current_send_step]);
+    if (!estop_triggered && trajectory_ready &&
+        current_send_step <= total_steps) {
+      HAL_StatusTypeDef status = SendMotorCommands(
+          all_commands[current_send_step], all_deltas[current_send_step]);
       if (status != HAL_OK) {
         FDCAN_ProtocolStatusTypeDef protocol_status = {0};
         (void)HAL_FDCAN_GetProtocolStatus(&CAN, &protocol_status);
@@ -428,8 +471,40 @@ int main(void) {
 
       if (trajectory_ready && sync_index <= total_steps) {
         CAN_Bus_SendU8(&CAN, 0x0F, CAN_ID_SYNC, CAN_Priority_HIGH, sync_index);
+        printf("CAN Tx SYNC -> Broadcast ID 0x0F: value_u8 = %d\r\n",
+               sync_index);
         sync_index++;
+      } else if (trajectory_ready && sync_index > total_steps) {
+        trajectory_ready = false;
+        r_current = points[current_segment + 1];
+        printf("\r\nTrajectory segment %d finished. Standing by at: x=%.4f, "
+               "y=%.4f, "
+               "z=%.4f m\r\n",
+               current_segment, r_current.x, r_current.y, r_current.z);
+
+        if (current_segment < 1) {
+          in_delay = true;
+          delay_start_tick = HAL_GetTick();
+          printf("Starting 3-second delay before next segment...\r\n");
+        } else {
+          printf("All planned movements completed successfully!\r\n");
+        }
       }
+    }
+
+    /* Handle inter-segment delay and transition to next segment */
+    if (in_delay && (HAL_GetTick() - delay_start_tick >= 3000)) {
+      in_delay = false;
+      current_segment++;
+      printf("Delay finished. Starting segment %d: [%.4f, %.4f, %.4f] -> "
+             "[%.4f, %.4f, %.4f]\r\n",
+             current_segment, points[current_segment].x,
+             points[current_segment].y, points[current_segment].z,
+             points[current_segment + 1].x, points[current_segment + 1].y,
+             points[current_segment + 1].z);
+
+      compute_trajectory(points[current_segment], points[current_segment + 1]);
+      trajectory_ready = true;
     }
 
     /* 2.5. Send a ping to the ESP32 (USART1) every 1000ms */
@@ -741,7 +816,8 @@ int __io_putchar(int ch) {
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
   if (GPIO_Pin == EStop_Pin) {
     estop_triggered = 1;
-    CAN_Bus_SendU8(&CAN, CAN_BROADCAST_ID, CAN_ID_EMERGENCY, CAN_Priority_VERY_HIGH, 0x00);
+    CAN_Bus_SendU8(&CAN, CAN_BROADCAST_ID, CAN_ID_EMERGENCY,
+                   CAN_Priority_VERY_HIGH, 0x00);
     printf("E-STOP Triggered! Emergency CAN message sent.\r\n");
   }
 }
