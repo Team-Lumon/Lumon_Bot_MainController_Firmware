@@ -65,10 +65,11 @@ static int current_send_step = 0;
 static bool trajectory_ready = false;
 Vector3_t r_current = {0.46f, 0.46f, 0.0f};
 static int sync_index = 0;
-static Vector3_t points[3] = {
+static Vector3_t points[4] = {
     {0.465f, 0.445f, 0.1f}, // Start
     {0.465f, 0.25f, 0.2f},  // Pos 1
-    {0.465f, 0.25f, 0.6f}   // Pos 2
+    {0.465f, 0.25f, 0.6f},  // Pos 2
+    {0.465f, 0.7f, 0.6f}    // Pos 3
 };
 static int current_segment = 0;
 static bool in_delay = false;
@@ -189,6 +190,31 @@ void compute_trajectory(Vector3_t start, Vector3_t end) {
                               100000.0f;
       }
     }
+
+    printf("---- t = %.2f s (Step %d/%d) ----\r\n", t, step, total_steps);
+    printf("Target Pos : [%.4f, %.4f, %.4f] m\r\n", r_out.x, r_out.y, r_out.z);
+    printf("Target Vel : [%.4f, %.4f, %.4f] m/s\r\n", r_dot_out.x, r_dot_out.y, r_dot_out.z);
+    
+    printf("Cable Lens : ");
+    for (int i = 0; i < 8; i++) {
+      printf("%.4f ", all_commands[step][i].L_total);
+    }
+    
+    printf("\r\nCable Vels : ");
+    for (int i = 0; i < 8; i++) {
+      printf("%+.4f ", all_commands[step][i].L_dot);
+    }
+    
+    printf("\r\nTensions   : ");
+    for (int i = 0; i < 8; i++) {
+      printf("%.2f ", all_commands[step][i].tau);
+    }
+    
+    printf("\r\nDeltas     : ");
+    for (int i = 0; i < 8; i++) {
+      printf("%.0f ", all_deltas[step][i]);
+    }
+    printf("\r\n\n");
   }
   uint32_t elapsed_tick = HAL_GetTick() - start_tick;
 
@@ -482,7 +508,7 @@ int main(void) {
                "z=%.4f m\r\n",
                current_segment, r_current.x, r_current.y, r_current.z);
 
-        if (current_segment < 1) {
+        if (current_segment < 2) {
           in_delay = true;
           delay_start_tick = HAL_GetTick();
           printf("Starting 3-second delay before next segment...\r\n");
