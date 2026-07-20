@@ -288,7 +288,7 @@ void run_ik_test(void) {
 
   printf(
       "\r\nSetup complete. Waiting 2 seconds for motors to pre-tension...\r\n");
-  HAL_Delay(2000);
+  HAL_Delay(1000);
 
   trajectory_ready = true;
 }
@@ -511,7 +511,7 @@ int main(void) {
         if (current_segment < 2) {
           in_delay = true;
           delay_start_tick = HAL_GetTick();
-          printf("Starting 3-second delay before next segment...\r\n");
+          printf("Starting 1-second delay before next segment...\r\n");
         } else {
           printf("All planned movements completed successfully!\r\n");
         }
@@ -519,7 +519,7 @@ int main(void) {
     }
 
     /* Handle inter-segment delay and transition to next segment */
-    if (in_delay && (HAL_GetTick() - delay_start_tick >= 3000)) {
+    if (in_delay && (HAL_GetTick() - delay_start_tick >= 000)) {
       in_delay = false;
       current_segment++;
       printf("Delay finished. Starting segment %d: [%.4f, %.4f, %.4f] -> "
