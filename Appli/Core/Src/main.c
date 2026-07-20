@@ -169,7 +169,7 @@ void compute_trajectory(Vector3_t start, Vector3_t end) {
 
   Vector3_t r_out, r_dot_out;
 
-  printf("Pre-calculating all trajectory steps...\r\n");
+  // printf("Pre-calculating all trajectory steps...\r\n");
 
   uint32_t start_tick = HAL_GetTick();
   for (int step = 0; step <= total_steps; ++step) {
@@ -191,30 +191,33 @@ void compute_trajectory(Vector3_t start, Vector3_t end) {
       }
     }
 
+    /*
     printf("---- t = %.2f s (Step %d/%d) ----\r\n", t, step, total_steps);
     printf("Target Pos : [%.4f, %.4f, %.4f] m\r\n", r_out.x, r_out.y, r_out.z);
-    printf("Target Vel : [%.4f, %.4f, %.4f] m/s\r\n", r_dot_out.x, r_dot_out.y, r_dot_out.z);
-    
+    printf("Target Vel : [%.4f, %.4f, %.4f] m/s\r\n", r_dot_out.x, r_dot_out.y,
+           r_dot_out.z);
+
     printf("Cable Lens : ");
     for (int i = 0; i < 8; i++) {
       printf("%.4f ", all_commands[step][i].L_total);
     }
-    
+
     printf("\r\nCable Vels : ");
     for (int i = 0; i < 8; i++) {
       printf("%+.4f ", all_commands[step][i].L_dot);
     }
-    
+
     printf("\r\nTensions   : ");
     for (int i = 0; i < 8; i++) {
       printf("%.2f ", all_commands[step][i].tau);
     }
-    
+
     printf("\r\nDeltas     : ");
     for (int i = 0; i < 8; i++) {
       printf("%.0f ", all_deltas[step][i]);
     }
     printf("\r\n\n");
+    */
   }
   uint32_t elapsed_tick = HAL_GetTick() - start_tick;
 
@@ -252,8 +255,10 @@ void compute_trajectory(Vector3_t start, Vector3_t end) {
   }
   */
 
+  /*
   printf("===> Pure Kinematics Calculation Time: %lu ms <===\r\n",
          (unsigned long)elapsed_tick);
+  */
 
   current_send_step = 0;
   sync_index = 0;
@@ -289,6 +294,13 @@ void run_ik_test(void) {
   printf(
       "\r\nSetup complete. Waiting 2 seconds for motors to pre-tension...\r\n");
   HAL_Delay(1000);
+
+  printf("Requesting initial encoder readouts from all motors...\r\n");
+  for (int i = 0; i < 8; i++) {
+    CAN_Bus_SendU8(&CAN, (uint8_t)(i + 1), CAN_ID_DEBUG, CAN_Priority_HIGH,
+                   0x02);
+    HAL_Delay(1);
+  }
 
   trajectory_ready = true;
 }
@@ -351,6 +363,14 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *fdcan_handle,
         printf("Debug value: %lu\r\n",
                (unsigned long)CAN_Bus_ReadU32(&message));
         break;
+      case CAN_ID_ENCODER: {
+        uint16_t raw_data = CAN_Bus_ReadU16(&message);
+        uint8_t motor_id = (uint8_t)((raw_data >> 12) & 0x0FU);
+        uint16_t encoder_counts = raw_data & 0x0FFFU;
+        printf("Encoder report from device 0x%X: %u counts\r\n", motor_id,
+               encoder_counts);
+        break;
+      }
       default:
         printf("Received message with unhandled ID: 0x%03lX\r\n",
                (unsigned long)message.messageId);
@@ -475,6 +495,7 @@ int main(void) {
   printf("\r\n--- RUNNING WITH 100MS (10Hz) SYNC TIMER ---\r\n");
 
   while (1) {
+    /* 1. Commented out IK message sending for testing encoder readouts
     if (!estop_triggered && trajectory_ready &&
         current_send_step <= total_steps) {
       HAL_StatusTypeDef status = SendMotorCommands(
@@ -490,8 +511,9 @@ int main(void) {
       }
       current_send_step++;
     }
+    */
 
-    /* 2. Send a SYNC message exactly every 100ms */
+    /* 2. Commented out SYNC message sending for testing encoder readouts
     if (!estop_triggered && (HAL_GetTick() - last_sync_tick >= 100)) {
       last_sync_tick = HAL_GetTick();
 
@@ -517,6 +539,7 @@ int main(void) {
         }
       }
     }
+    */
 
     /* Handle inter-segment delay and transition to next segment */
     if (in_delay && (HAL_GetTick() - delay_start_tick >= 000)) {

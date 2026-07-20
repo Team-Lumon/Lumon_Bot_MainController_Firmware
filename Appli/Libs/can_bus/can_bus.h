@@ -15,6 +15,7 @@ typedef enum {
   CAN_ID_ADC_REPORT = 0x5U,
   CAN_INIT = 0x5U,
   CAN_ID_DEBUG = 0x6U,
+  CAN_ID_ENCODER = 0x7U,
   CAN_MessageId_Invalid = 0xFU
 } CAN_BusMessageId_t;
 
