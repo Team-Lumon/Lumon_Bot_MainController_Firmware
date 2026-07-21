@@ -25,6 +25,7 @@
 #include "can_bus.h"
 #include "ik_wrapper.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 /* USER CODE END Includes */
 
@@ -63,17 +64,145 @@ static float all_deltas[151][8];
 static int total_steps = 150;
 static int current_send_step = 0;
 static bool trajectory_ready = false;
-Vector3_t r_current = {0.46f, 0.46f, 0.0f};
+Vector3_t r_current = {0.465f, 0.445f, 0.1f};
 static int sync_index = 0;
-static Vector3_t points[4] = {
+#define MAX_POINTS 16
+static Vector3_t points[MAX_POINTS] = {
     {0.465f, 0.445f, 0.1f}, // Start
     {0.465f, 0.25f, 0.2f},  // Pos 1
     {0.465f, 0.25f, 0.6f},  // Pos 2
     {0.465f, 0.7f, 0.6f}    // Pos 3
 };
+static int total_points = 4;
+
+#define PC_RX_BUFFER_SIZE  256
+static char pc_rx_buffer[PC_RX_BUFFER_SIZE];
+static uint16_t pc_rx_index = 0;
+static bool pc_rx_buffering = false;
+
+void run_pretension(void);
+
+void ParsePoints(const char *str) {
+  printf("\r\n--- Serial Data Received: '%s' ---\r\n", str);
+  
+  // Point 0 is set to current end position of the robot
+  points[0] = r_current;
+  
+  int parsed_count = 0;
+  const char *p = str;
+  
+  while (*p && *p != '[') p++;
+  if (*p == '[') p++;
+  
+  while (*p && *p != ']' && (parsed_count + 1) < MAX_POINTS) {
+    while (*p && *p != '(' && *p != '{' && *p != ']') p++;
+    if (*p == ']' || *p == '\0') break;
+    p++;
+    
+    char *endptr;
+    float x = strtof(p, &endptr);
+    if (endptr == p) break;
+    p = endptr;
+    while (*p && (*p == ' ' || *p == ',')) p++;
+    
+    float y = strtof(p, &endptr);
+    if (endptr == p) break;
+    p = endptr;
+    while (*p && (*p == ' ' || *p == ',')) p++;
+    
+    float z = strtof(p, &endptr);
+    if (endptr == p) break;
+    p = endptr;
+    
+    // Check if coordinate is (-1, -1, -1) or (-1, -1, 1) for pre-tensioning command
+    if (x == -1.0f && y == -1.0f && (z == -1.0f || z == 1.0f)) {
+      printf("\r\nReceived pre-tensioning coordinate -> Resetting start position to Home [0.4650, 0.4450, 0.1000] & Running Cable Pre-Tensioning!\r\n");
+      run_pretension();
+      return;
+    }
+    
+    // Fill starting from index 1 (after current position at index 0)
+    points[parsed_count + 1].x = x;
+    points[parsed_count + 1].y = y;
+    points[parsed_count + 1].z = z;
+    parsed_count++;
+    
+    while (*p && *p != ')' && *p != '}' && *p != ']') p++;
+    if (*p == ')' || *p == '}') p++;
+  }
+  
+  if (parsed_count > 0) {
+    total_points = parsed_count + 1;
+    printf("Successfully parsed %d new target points!\r\n", parsed_count);
+    for (int i = 0; i < total_points; i++) {
+      printf("  Point %d: x=%.4f, y=%.4f, z=%.4f m%s\r\n", 
+             i + 1, points[i].x, points[i].y, points[i].z, 
+             (i == 0) ? " (Start position from last motion)" : "");
+    }
+  } else {
+    printf("Error parsing coordinates from string!\r\n");
+  }
+}
+
 static int current_segment = 0;
 static bool in_delay = false;
 static uint32_t delay_start_tick = 0;
+static uint8_t sync_done_mask = 0;
+static bool gripper_open_state = false;
+static bool segment_waiting_sync = false;
+static uint32_t segment_end_tick = 0;
+
+void TriggerEStop(void) {
+  estop_triggered = 1;
+  trajectory_ready = false;
+  in_delay = false;
+  segment_waiting_sync = false;
+  printf("\r\n=========================================\r\n");
+  printf("         !!! E-STOP TRIGGERED !!!        \r\n");
+  printf("   CAN SYNC Broadcasts Halted Immediately \r\n");
+  printf("=========================================\r\n");
+}
+
+void SendGripperCommandToESP32(void) {
+  // Gripper code disabled for now
+  /*
+  gripper_open_state = !gripper_open_state;
+  const char *cmd = gripper_open_state ? "GRIPPER:OPEN\r\n" : "GRIPPER:CLOSE\r\n";
+  for (int i = 0; cmd[i] != '\0'; i++) {
+    while (!(USART1->ISR & USART_ISR_TXE_TXFNF))
+      ;
+    USART1->TDR = cmd[i];
+  }
+  printf("\r\n--- Segment Completion / All Motor SYNC Received! Sent '%s' to ESP32 ---\r\n", cmd);
+  */
+}
+
+#define ENCODER_FLASH_ADDRESS  0x0800E000U
+
+static uint16_t saved_encoders[8] = {0};
+static uint16_t received_encoders[8] = {0};
+static uint8_t received_encoders_mask = 0;
+
+void SaveEncodersToFlash(uint16_t *encoders) {
+  HAL_FLASH_Unlock();
+  FLASH_EraseInitTypeDef EraseInitStruct = {0};
+  uint32_t SectorError = 0;
+  EraseInitStruct.TypeErase = FLASH_TYPEERASE_SECTORS;
+  EraseInitStruct.Sector = 7;
+  EraseInitStruct.NbSectors = 1;
+  
+  if (HAL_FLASHEx_Erase(&EraseInitStruct, &SectorError) == HAL_OK) {
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, ENCODER_FLASH_ADDRESS, (uint32_t)encoders);
+  }
+  HAL_FLASH_Lock();
+}
+
+void LoadEncodersFromFlash(uint16_t *encoders) {
+  uint16_t *flash_ptr = (uint16_t *)ENCODER_FLASH_ADDRESS;
+  for (int i = 0; i < 8; i++) {
+    encoders[i] = flash_ptr[i];
+  }
+}
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -145,11 +274,13 @@ HAL_StatusTypeDef SendMotorCommands(const MotorCommand_t *commands,
     // Check if transmission completed successfully (ACKed) via TXBTO register
     bool acked = (hfdcan1.Instance->TXBTO & active_buffer_mask) != 0U;
 
+    /*
     printf("CAN Tx command -> Motor ID %u: Packed: 0x%08lX (Status: %s, ACK: "
            "%s)\r\n",
            motor_ids[i], (unsigned long)packed_val,
            (status == HAL_OK) ? "Queued OK" : "Queue FULL",
            acked ? "YES" : "NO");
+    */
 
     if (status != HAL_OK) {
       overall_status = status;
@@ -160,7 +291,7 @@ HAL_StatusTypeDef SendMotorCommands(const MotorCommand_t *commands,
 }
 
 void compute_trajectory(Vector3_t start, Vector3_t end) {
-  float T_MOVE = 10.0f;
+  float T_MOVE = 7.0f;
   float FRAME_DT = 0.1f;
 
   total_steps = (int)(T_MOVE / FRAME_DT);
@@ -264,43 +395,60 @@ void compute_trajectory(Vector3_t start, Vector3_t end) {
   sync_index = 0;
 }
 
+void run_pretension(void) {
+  printf("\r\n=== Running Pre-Tensioning Sequence ===\r\n");
+  
+  // Reset current position tracker to Home position
+  r_current.x = 0.465f;
+  r_current.y = 0.445f;
+  r_current.z = 0.1f;
+  points[0] = r_current;
+
+  static const uint16_t fallback_ticks[8] = {3772, 867, 334, 722,
+                                             1781, 246, 522, 876};
+  uint16_t current_init_ticks[8];
+
+  printf("Loading saved encoder counts from internal flash...\r\n");
+  LoadEncodersFromFlash(saved_encoders);
+  
+  bool flash_valid = (saved_encoders[0] != 0xFFFF && saved_encoders[0] != 0);
+
+  printf("Loaded encoder counts: ");
+  for (int i = 0; i < 8; i++) {
+    if (flash_valid) {
+      current_init_ticks[i] = saved_encoders[i];
+    } else {
+      current_init_ticks[i] = fallback_ticks[i];
+    }
+    printf("Motor %d: %u (%s), ", i + 1, current_init_ticks[i], flash_valid ? "Flash" : "Fallback");
+  }
+  printf("\r\n");
+
+  printf("Sending individual pre-tension ticks to each motor...\r\n");
+  for (int i = 0; i < 8; i++) {
+    CAN_Bus_SendU16(&CAN, (uint8_t)(i + 1), CAN_INIT, CAN_Priority_HIGH,
+                    current_init_ticks[i]);
+    HAL_Delay(5);
+  }
+
+  printf("Waiting 5 seconds for motors to physically center...\r\n");
+  HAL_Delay(5000);
+  printf("Pre-tensioning sequence complete!\r\n");
+}
+
 void run_ik_test(void) {
   printf("\r\n=== Running IK Trajectory Test ===\r\n");
+  current_segment = 0;
+
+  printf("Target Trajectory Points (from RAM):\r\n");
+  for (int i = 0; i < total_points; i++) {
+    printf("  Point %d: x=%.4f, y=%.4f, z=%.4f m\r\n", i + 1, points[i].x, points[i].y, points[i].z);
+  }
+
   Vector3_t r_start = points[0];
   Vector3_t r_end = points[1];
 
   compute_trajectory(r_start, r_end);
-  // r_current = r_end;
-
-  // Array of target initialization ticks for motors 1 through 8
-  static const uint16_t init_ticks[8] = {3772, 867, 334, 722,
-                                         1781, 246, 522, 876};
-
-  printf("Sending individual pre-tension ticks to each motor...\r\n");
-  for (int i = 0; i < 8; i++) {
-    // Send standard init command to the respective motor
-    CAN_Bus_SendU16(&CAN, (uint8_t)(i + 1), CAN_INIT, CAN_Priority_HIGH,
-                    init_ticks[i]);
-    HAL_Delay(5);
-  }
-
-  //  printf("Enabling motors...\r\n");
-  //  // Enable the motors (e.g. config message or status request)
-  //  for (int i = 0; i < 8; i++) {
-  //    CAN_Bus_SendU16(&CAN, (uint8_t)(i + 1), CAN_INIT, CAN_Priority_HIGH,
-  //    0x0); HAL_Delay(5);
-  //  }
-
-  printf(
-      "\r\nSetup complete. Waiting 2 seconds for motors to pre-tension...\r\n");
-  HAL_Delay(1000);
-
-  printf("Requesting initial encoder readouts from all motors...\r\n");
-  for (int i = 0; i < 8; i++) {
-    CAN_Bus_SendU8(&CAN, (uint8_t)(i + 1), CAN_ID_DEBUG, CAN_Priority_HIGH,
-                   0x02);
-    HAL_Delay(1);
-  }
 
   trajectory_ready = true;
 }
@@ -369,6 +517,28 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *fdcan_handle,
         uint16_t encoder_counts = raw_data & 0x0FFFU;
         printf("Encoder report from device 0x%X: %u counts\r\n", motor_id,
                encoder_counts);
+        if (motor_id >= 1 && motor_id <= 8) {
+          received_encoders[motor_id - 1] = encoder_counts;
+          received_encoders_mask |= (1U << (motor_id - 1));
+          if (received_encoders_mask == 0xFFU) {
+            printf("All 8 encoder reports received! Saving to internal flash...\r\n");
+            SaveEncodersToFlash(received_encoders);
+            received_encoders_mask = 0U;
+          }
+        }
+        break;
+      }
+      case CAN_ID_SYNC: {
+        uint8_t dev_id = message.deviceId;
+        if (dev_id >= 1 && dev_id <= 8) {
+          sync_done_mask |= (1U << (dev_id - 1));
+          printf("Motor PCB %d reported SYNC complete (mask: 0x%02X)\r\n", dev_id, sync_done_mask);
+          if (sync_done_mask == 0xFFU) {
+            sync_done_mask = 0U;
+            segment_waiting_sync = false;
+            SendGripperCommandToESP32();
+          }
+        }
         break;
       }
       default:
@@ -481,7 +651,20 @@ int main(void) {
   initGeometry();
   printf("IK Geometry Initialized.\r\n");
 
-  run_ik_test();
+  printf("Loading saved encoder counts from internal flash...\r\n");
+  LoadEncodersFromFlash(saved_encoders);
+  bool init_flash_valid = (saved_encoders[0] != 0xFFFF && saved_encoders[0] != 0);
+  printf("Current stored encoder counts: ");
+  for (int i = 0; i < 8; i++) {
+    printf("Motor %d: %u (%s), ", i + 1, saved_encoders[i], init_flash_valid ? "Flash" : "Fallback (not set)");
+  }
+  printf("\r\n");
+
+  printf("\r\n=======================================================\r\n");
+  printf("Lumon Bot Main Controller Initialized!\r\n");
+  printf("  -> Press 'c' / 'C' to start calibration\r\n");
+  printf("  -> Press 'r' / 'R' to run pre-tension and IK movement\r\n");
+  printf("=======================================================\r\n\r\n");
 
   /* USER CODE END 2 */
 
@@ -495,7 +678,7 @@ int main(void) {
   printf("\r\n--- RUNNING WITH 100MS (10Hz) SYNC TIMER ---\r\n");
 
   while (1) {
-    /* 1. Commented out IK message sending for testing encoder readouts
+    /* 1. IK message sending */
     if (!estop_triggered && trajectory_ready &&
         current_send_step <= total_steps) {
       HAL_StatusTypeDef status = SendMotorCommands(
@@ -511,26 +694,27 @@ int main(void) {
       }
       current_send_step++;
     }
-    */
 
-    /* 2. Commented out SYNC message sending for testing encoder readouts
+    /* 2. SYNC message sending */
     if (!estop_triggered && (HAL_GetTick() - last_sync_tick >= 100)) {
       last_sync_tick = HAL_GetTick();
 
       if (trajectory_ready && sync_index <= total_steps) {
         CAN_Bus_SendU8(&CAN, 0x0F, CAN_ID_SYNC, CAN_Priority_HIGH, sync_index);
-        printf("CAN Tx SYNC -> Broadcast ID 0x0F: value_u8 = %d\r\n",
-               sync_index);
+        printf("CAN Tx SYNC -> Broadcast ID 0x0F: value_u8 = %d\r\n", sync_index);
         sync_index++;
       } else if (trajectory_ready && sync_index > total_steps) {
         trajectory_ready = false;
         r_current = points[current_segment + 1];
-        printf("\r\nTrajectory segment %d finished. Standing by at: x=%.4f, "
+        segment_waiting_sync = true;
+        segment_end_tick = HAL_GetTick();
+        printf("\r\n--- CAN SYNC Broadcast Stopped (Completed %d steps for Segment %d) ---\r\n", total_steps, current_segment);
+        printf("Trajectory segment %d finished. Standing by at: x=%.4f, "
                "y=%.4f, "
                "z=%.4f m\r\n",
                current_segment, r_current.x, r_current.y, r_current.z);
 
-        if (current_segment < 2) {
+        if (current_segment < total_points - 2) {
           in_delay = true;
           delay_start_tick = HAL_GetTick();
           printf("Starting 1-second delay before next segment...\r\n");
@@ -539,10 +723,19 @@ int main(void) {
         }
       }
     }
-    */
+
+    /* 2.2. 3-Second Timeout check for Motor PCB SYNC Completion Reports */
+    if (segment_waiting_sync && (HAL_GetTick() - segment_end_tick >= 3000)) {
+      segment_waiting_sync = false;
+      if (sync_done_mask != 0xFFU) {
+        printf("3-second timeout waiting for motor SYNC completion reports (received mask: 0x%02X). Triggering Gripper fallback...\r\n", sync_done_mask);
+        sync_done_mask = 0U;
+        SendGripperCommandToESP32();
+      }
+    }
 
     /* Handle inter-segment delay and transition to next segment */
-    if (in_delay && (HAL_GetTick() - delay_start_tick >= 000)) {
+    if (!estop_triggered && in_delay && (HAL_GetTick() - delay_start_tick >= 000)) {
       in_delay = false;
       current_segment++;
       printf("Delay finished. Starting segment %d: [%.4f, %.4f, %.4f] -> "
@@ -581,17 +774,77 @@ int main(void) {
           USART_ICR_ORECF | USART_ICR_NECF | USART_ICR_FECF | USART_ICR_PECF;
     }
 
-    /* Forward data from PC (USART3) to ESP32 (USART1) */
+    /* Forward and process data from PC (USART3) to ESP32 (USART1) */
     if (USART3->ISR & USART_ISR_RXNE_RXFNE) {
       uint8_t byte = USART3->RDR;
+      
+      if (byte == '[') {
+        pc_rx_index = 0;
+        pc_rx_buffering = true;
+      }
+      
+      if (pc_rx_buffering) {
+        if (pc_rx_index < PC_RX_BUFFER_SIZE - 1) {
+          pc_rx_buffer[pc_rx_index++] = (char)byte;
+        }
+        if (byte == ']') {
+          pc_rx_buffer[pc_rx_index] = '\0';
+          pc_rx_buffering = false;
+          ParsePoints(pc_rx_buffer);
+        }
+      } else {
+        if (byte == 'c' || byte == 'C') {
+          printf("\r\n--- Calibration Command Received! Requesting Encoders (20ms space)... ---\r\n");
+          received_encoders_mask = 0;
+          for (int i = 0; i < 8; i++) {
+            CAN_Bus_SendU8(&CAN, (uint8_t)(i + 1), CAN_ID_DEBUG, CAN_Priority_HIGH, 0x02);
+            HAL_Delay(20);
+          }
+        }
+
+        if (byte == 'r' || byte == 'R') {
+          run_ik_test();
+        }
+      }
+
       while (!(USART1->ISR & USART_ISR_TXE_TXFNF))
         ;
       USART1->TDR = byte;
     }
 
-    /* Forward data from ESP32 (USART1) to PC (USART3) */
+    /* Forward and process data from ESP32 (USART1) to PC (USART3) */
     if (USART1->ISR & USART_ISR_RXNE_RXFNE) {
       uint8_t byte = USART1->RDR;
+
+      if (byte == '[') {
+        pc_rx_index = 0;
+        pc_rx_buffering = true;
+      }
+
+      if (pc_rx_buffering) {
+        if (pc_rx_index < PC_RX_BUFFER_SIZE - 1) {
+          pc_rx_buffer[pc_rx_index++] = (char)byte;
+        }
+        if (byte == ']') {
+          pc_rx_buffer[pc_rx_index] = '\0';
+          pc_rx_buffering = false;
+          ParsePoints(pc_rx_buffer);
+        }
+      } else {
+        if (byte == 'c' || byte == 'C') {
+          printf("\r\n--- Calibration Command Received from ESP32! Requesting Encoders (20ms space)... ---\r\n");
+          received_encoders_mask = 0;
+          for (int i = 0; i < 8; i++) {
+            CAN_Bus_SendU8(&CAN, (uint8_t)(i + 1), CAN_ID_DEBUG, CAN_Priority_HIGH, 0x02);
+            HAL_Delay(20);
+          }
+        }
+
+        if (byte == 'r' || byte == 'R') {
+          run_ik_test();
+        }
+      }
+
       while (!(USART3->ISR & USART_ISR_TXE_TXFNF))
         ;
       USART3->TDR = byte;
@@ -824,7 +1077,8 @@ static void MX_GPIO_Init(void) {
 
   /* USER CODE END MX_GPIO_Init_1 */
 
-  /* GPIO Ports Clock Enable */
+  /* GPIO Ports & SBS Clock Enable */
+  __HAL_RCC_SBS_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOP_CLK_ENABLE();
   __HAL_RCC_GPIOO_CLK_ENABLE();
@@ -864,10 +1118,7 @@ int __io_putchar(int ch) {
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
   if (GPIO_Pin == EStop_Pin) {
-    estop_triggered = 1;
-    CAN_Bus_SendU8(&CAN, CAN_BROADCAST_ID, CAN_ID_EMERGENCY,
-                   CAN_Priority_VERY_HIGH, 0x00);
-    printf("E-STOP Triggered! Emergency CAN message sent.\r\n");
+    TriggerEStop();
   }
 }
 /* USER CODE END 4 */
