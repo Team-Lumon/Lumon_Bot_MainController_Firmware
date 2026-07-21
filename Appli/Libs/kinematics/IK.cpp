@@ -8,7 +8,7 @@
 using namespace Eigen;
 
 // --- System Configuration Constants ---
-const float T_MOVE = 10.0f;
+const float T_MOVE = 7.0f;
 const float MASS = 2.0f;
 const float GRAVITY = 9.81f;
 const float R_PULLEY = 0.015f;
